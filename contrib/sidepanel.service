@@ -1,0 +1,15 @@
+[Unit]
+Description=Side Panel launcher
+# Start with the graphical session and stop with it.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# Adjust to the installed location.
+ExecStart=%h/.local/bin/sidepanel
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

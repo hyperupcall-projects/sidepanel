@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Side Panel
+Comment=Low-latency side-panel launcher
+# Adjust to the installed location, or rely on it being in $PATH.
+Exec=sidepanel
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+OnlyShowIn=KDE;

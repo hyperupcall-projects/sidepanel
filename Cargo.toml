@@ -1,0 +1,33 @@
+[package]
+name = "sidepanel"
+version = "0.1.0"
+edition = "2021"
+description = "Low-latency side-panel launcher for KDE Plasma on Wayland"
+license = "MIT"
+
+[dependencies]
+# Wayland client toolkit. `calloop` gives us an event loop we can multiplex with
+# the D-Bus thread.
+#
+# NOTE: keyboard handling (Escape to dismiss) lives behind SCTK's `xkbcommon`
+# feature, which needs the system `libxkbcommon-dev` package. It is left out of
+# the MVP so the project builds on a stock system; see README for how to add it.
+smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop"] }
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+wayland-client = "0.31"
+
+# KGlobalAccel (KDE's global-shortcut broker) is spoken over D-Bus.
+zbus = { version = "5", features = ["blocking-api"] }
+
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+
+# Startup latency matters for a launcher: a smaller, LTO'd binary loads faster.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

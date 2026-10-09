@@ -1,0 +1,18 @@
+# Example config for sidepanel.
+# Copy to: $XDG_CONFIG_HOME/sidepanel/config.toml  (usually ~/.config/sidepanel/config.toml)
+# Every field is optional; omitted fields use the defaults shown here.
+
+# Which screen edge to anchor the panel to: "left" or "right".
+side = "left"
+
+# Panel width in logical pixels. Height always fills the screen.
+width = 150
+
+# Global shortcut, as Modifier+Key. Modifiers: Meta/Super/Logo/Win, Ctrl,
+# Alt, Shift. Keys: a-z, 0-9, space, escape, tab, return, backspace, delete,
+# home, end, left/up/right/down, pageup, pagedown, f1-f12.
+#
+# This is only the *default*: once registered it also appears in
+# System Settings -> Shortcuts, where the user can rebind it. A user-set
+# binding is respected on subsequent launches.
+shortcut = "Meta+F"
