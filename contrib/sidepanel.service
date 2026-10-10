@@ -3,6 +3,8 @@ Description=Side Panel launcher
 # Start with the graphical session and stop with it.
 After=graphical-session.target
 PartOf=graphical-session.target
+# Wayland only; skip the unit in an X11 session.
+ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
 Type=simple

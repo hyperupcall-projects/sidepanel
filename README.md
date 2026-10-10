@@ -61,12 +61,31 @@ It runs as a daemon (it does not exit). Press **Meta+F** to toggle the panel.
 
 ## Install / autostart
 
-Copy the binary somewhere on `$PATH` (e.g. `~/.local/bin/sidepanel`), then use
-one of the provided files in `contrib/`:
+Run the installer, which builds the binary, installs it to `~/.local/bin`, and
+sets up a **systemd user service** bound to the graphical session:
 
-- `contrib/sidepanel.desktop` → `~/.config/autostart/`
-- `contrib/sidepanel.service` → `~/.config/systemd/user/` then
-  `systemctl --user enable --now sidepanel.service`
+```sh
+./contrib/install.sh
+```
+
+That is equivalent to:
+
+- copy `target/release/sidepanel` to `~/.local/bin/sidepanel`,
+- copy `contrib/sidepanel.service` to `~/.config/systemd/user/`,
+- `systemctl --user enable --now sidepanel.service`.
+
+The service starts with `graphical-session.target` and stops with it. It is
+deliberately **not** lingered: the app needs `WAYLAND_DISPLAY`, which only
+exists inside a graphical session.
+
+Useful flags: `--prefix DIR` (install elsewhere), `--no-start` (enable but do
+not start now), `--uninstall`.
+
+> The installer uses systemd rather than the XDG autostart protocol. On Plasma 6
+> the autostart path is backed by systemd anyway, but its generated unit
+> hardcodes `Restart=no`, so a crashed daemon would not come back until the next
+> login. (`contrib/sidepanel.desktop` is retained for reference but is not used
+> by the installer.)
 
 ## Configuration
 
