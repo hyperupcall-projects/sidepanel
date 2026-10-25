@@ -11,6 +11,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use calloop::channel::Sender;
+use smithay_client_toolkit::seat::keyboard::{Keysym, Modifiers};
+use std::sync::mpsc;
 
 use crate::config::Config;
 
@@ -27,11 +29,14 @@ const ACTION_FRIENDLY: &str = "Toggle Side Panel";
 /// action's default binding (what "Reset" in System Settings restores).
 const SET_PRESENT: u32 = 0x2;
 const IS_DEFAULT: u32 = 0x8;
+const NO_AUTOLOADING: u32 = 0x4;
 
 /// Messages sent from the D-Bus thread to the Wayland event loop.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum HotkeyEvent {
     Toggle,
+    Registered(String),
+    Rebound(std::result::Result<String, String>),
 }
 
 #[zbus::proxy(
@@ -57,8 +62,17 @@ trait KGlobalAccel {
         flags: u32,
     ) -> zbus::Result<Vec<(Vec<i32>,)>>;
 
+    #[zbus(name = "globalShortcutAvailable")]
+    fn shortcut_available(&self, key: &(Vec<i32>,), component: &str) -> zbus::Result<bool>;
+
+    #[zbus(name = "shortcutKeys")]
+    fn shortcut_keys(&self, action_id: &[&str]) -> zbus::Result<Vec<(Vec<i32>,)>>;
+
     #[zbus(name = "getComponent")]
-    fn get_component(&self, component_unique: &str) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
+    fn get_component(
+        &self,
+        component_unique: &str,
+    ) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
 }
 
 #[zbus::proxy(
@@ -77,19 +91,24 @@ trait Component {
 
 /// Spawn the background thread that registers the shortcut and forwards presses
 /// to `sender` (which feeds the Wayland event loop).
-pub fn spawn(sender: Sender<HotkeyEvent>, config: Config) -> Result<()> {
+pub fn spawn(sender: Sender<HotkeyEvent>, config: Config) -> Result<mpsc::Sender<String>> {
+    let (requests, receiver) = mpsc::channel();
     std::thread::Builder::new()
         .name("kglobalaccel".into())
         .spawn(move || {
-            if let Err(err) = run(sender, &config) {
+            if let Err(err) = run(sender, &config, receiver) {
                 log::error!("global-shortcut listener stopped: {err:#}");
             }
         })
         .context("failed to spawn the global-shortcut thread")?;
-    Ok(())
+    Ok(requests)
 }
 
-fn run(sender: Sender<HotkeyEvent>, config: &Config) -> Result<()> {
+fn run(
+    sender: Sender<HotkeyEvent>,
+    config: &Config,
+    receiver: mpsc::Receiver<String>,
+) -> Result<()> {
     let conn =
         zbus::blocking::Connection::session().context("failed to connect to the session bus")?;
     let kga = KGlobalAccelProxyBlocking::new(&conn)
@@ -133,6 +152,25 @@ fn run(sender: Sender<HotkeyEvent>, config: &Config) -> Result<()> {
     let signals = component
         .receive_global_shortcut_pressed()
         .context("failed to subscribe to globalShortcutPressed")?;
+    if let Some(shortcut) = applied.first().and_then(|s| format_sequence(&s.0)) {
+        let _ = sender.send(HotkeyEvent::Registered(shortcut));
+    }
+    // Reuse the registering connection so KGlobalAccel keeps the same owner.
+    let worker_conn = conn.clone();
+    let worker_sender = sender.clone();
+    std::thread::Builder::new()
+        .name("shortcut-rebind".into())
+        .spawn(move || {
+            for shortcut in receiver {
+                let result = rebind(&worker_conn, &shortcut)
+                    .map(|()| shortcut)
+                    .map_err(|err| format!("{err:#}"));
+                if worker_sender.send(HotkeyEvent::Rebound(result)).is_err() {
+                    break;
+                }
+            }
+        })
+        .context("failed to start shortcut updater")?;
     for signal in signals {
         let args = signal.args().context("failed to decode the signal")?;
         if *args.action_unique() == ACTION && sender.send(HotkeyEvent::Toggle).is_err() {
@@ -140,6 +178,129 @@ fn run(sender: Sender<HotkeyEvent>, config: &Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn rebind(conn: &zbus::blocking::Connection, shortcut: &str) -> Result<()> {
+    let combined = parse_shortcut(shortcut)?;
+    let proxy = KGlobalAccelProxyBlocking::new(conn)?;
+    let action = [COMPONENT, ACTION, COMPONENT_FRIENDLY, ACTION_FRIENDLY];
+    let previous = proxy.shortcut_keys(&action)?;
+    let keys = vec![(encode_sequence(combined),)];
+    if previous == keys {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        proxy.shortcut_available(&keys[0], COMPONENT)?,
+        "Shortcut already in use; choose another."
+    );
+    let applied = proxy.set_shortcut_keys(&action, &keys, SET_PRESENT | NO_AUTOLOADING)?;
+    if applied != keys {
+        proxy
+            .set_shortcut_keys(&action, &previous, SET_PRESENT | NO_AUTOLOADING)
+            .context("Shortcut rejected and previous shortcut could not be restored")?;
+        anyhow::bail!("Shortcut rejected; previous shortcut restored.");
+    }
+    Ok(())
+}
+
+/// Convert a captured key using the compositor's active layout.
+/// Modifier-only presses wait for a key; unsupported/plain keys report an error.
+pub fn captured_shortcut(key: Keysym, modifiers: Modifiers) -> Result<Option<String>> {
+    let raw = key.raw();
+    if (0xffe1..=0xffee).contains(&raw) || raw == 0xff7f {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        modifiers.ctrl || modifiers.alt || modifiers.logo,
+        "Use Ctrl, Alt or Meta with a key."
+    );
+    let name = match raw {
+        0x41..=0x5a | 0x61..=0x7a | 0x30..=0x39 => {
+            (char::from_u32(raw).unwrap().to_ascii_uppercase()).to_string()
+        }
+        0x20 => "Space".into(),
+        0xff1b => "Escape".into(),
+        0xff09 | 0xfe20 => "Tab".into(),
+        0xff08 => "Backspace".into(),
+        0xff0d => "Return".into(),
+        0xffff => "Delete".into(),
+        0xff50 => "Home".into(),
+        0xff57 => "End".into(),
+        0xff51 => "Left".into(),
+        0xff52 => "Up".into(),
+        0xff53 => "Right".into(),
+        0xff54 => "Down".into(),
+        0xff55 => "PageUp".into(),
+        0xff56 => "PageDown".into(),
+        0xffbe..=0xffc9 => format!("F{}", raw - 0xffbe + 1),
+        _ => anyhow::bail!("Choose a letter, digit, F1–F12 or navigation key."),
+    };
+    let mut parts = Vec::new();
+    if modifiers.logo {
+        parts.push("Meta".to_string());
+    }
+    if modifiers.ctrl {
+        parts.push("Ctrl".to_string());
+    }
+    if modifiers.alt {
+        parts.push("Alt".to_string());
+    }
+    if modifiers.shift {
+        parts.push("Shift".to_string());
+    }
+    parts.push(name);
+    let shortcut = parts.join("+");
+    parse_shortcut(&shortcut)?;
+    Ok(Some(shortcut))
+}
+
+/// Display the actual startup binding returned by KDE, including custom ones.
+fn format_sequence(sequence: &[i32]) -> Option<String> {
+    let mut chords = Vec::new();
+    for &combined in sequence.iter().filter(|&&v| v != 0) {
+        let key = combined & 0x01ff_ffff;
+        let name = match key {
+            0x30..=0x39 | 0x41..=0x5a => char::from_u32(key as u32)?.to_string(),
+            0x20 => "Space".into(),
+            0x0100_0030..=0x0100_003b => format!("F{}", key - 0x0100_0030 + 1),
+            _ => [
+                "Escape",
+                "Tab",
+                "Backspace",
+                "Return",
+                "Delete",
+                "Home",
+                "End",
+                "Left",
+                "Up",
+                "Right",
+                "Down",
+                "PageUp",
+                "PageDown",
+            ]
+            .into_iter()
+            .find(|name| key_code(&name.to_ascii_lowercase()) == Some(key))?
+            .to_string(),
+        };
+        let mut parts = Vec::new();
+        for (flag, label) in [
+            (0x1000_0000, "Meta"),
+            (0x0400_0000, "Ctrl"),
+            (0x0800_0000, "Alt"),
+            (0x0200_0000, "Shift"),
+        ] {
+            if combined & flag != 0 {
+                parts.push(label.to_string());
+            }
+        }
+        parts.push(name);
+        chords.push(parts.join("+"));
+    }
+    if chords.is_empty() {
+        None
+    } else {
+        Some(chords.join(", "))
+    }
 }
 
 /// Parse a `Modifier+Key` shortcut into a Qt "combined" key code.
@@ -167,9 +328,14 @@ fn parse_shortcut(spec: &str) -> Result<i32> {
             "alt" => modifiers |= ALT,
             "shift" => modifiers |= SHIFT,
             other => {
-                key = Some(key_code(other).ok_or_else(|| {
-                    anyhow!("unsupported key '{other}' in shortcut '{spec}'")
-                })?);
+                anyhow::ensure!(
+                    key.is_none(),
+                    "shortcut must contain exactly one non-modifier key"
+                );
+                key =
+                    Some(key_code(other).ok_or_else(|| {
+                        anyhow!("unsupported key '{other}' in shortcut '{spec}'")
+                    })?);
             }
         }
     }
@@ -256,6 +422,65 @@ mod tests {
     #[test]
     fn meta_f_parses_to_the_expected_combined_code() {
         assert_eq!(parse_shortcut("Meta+F").unwrap(), 0x1000_0046);
+    }
+
+    #[test]
+    fn captures_and_formats_supported_shortcuts() {
+        let modifiers = Modifiers {
+            logo: true,
+            ctrl: true,
+            alt: true,
+            shift: true,
+            ..Modifiers::default()
+        };
+        for raw in [
+            0x61, 0x5a, 0x31, 0x20, 0xff09, 0xfe20, 0xff08, 0xff0d, 0xffff, 0xff50, 0xff57, 0xff51,
+            0xff52, 0xff53, 0xff54, 0xff55, 0xff56, 0xffbe, 0xffc9, 0xff1b,
+        ] {
+            let captured = captured_shortcut(Keysym::new(raw), modifiers)
+                .unwrap()
+                .unwrap();
+            let combined = parse_shortcut(&captured).unwrap();
+            assert_eq!(format_sequence(&encode_sequence(combined)), Some(captured));
+        }
+        let captured = captured_shortcut(
+            Keysym::new(0x66),
+            Modifiers {
+                logo: true,
+                ..Modifiers::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(captured.as_deref(), Some("Meta+F"));
+    }
+
+    #[test]
+    fn recorder_waits_for_modifiers_and_rejects_plain_or_unsupported_keys() {
+        for raw in 0xffe1..=0xffee {
+            assert_eq!(
+                captured_shortcut(Keysym::new(raw), Modifiers::default()).unwrap(),
+                None
+            );
+        }
+        assert!(captured_shortcut(Keysym::new(0x61), Modifiers::default()).is_err());
+        assert!(captured_shortcut(
+            Keysym::new(0x61),
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            }
+        )
+        .is_err());
+        assert!(captured_shortcut(
+            Keysym::new(0x1008ff12),
+            Modifiers {
+                logo: true,
+                ..Modifiers::default()
+            }
+        )
+        .is_err());
+        assert!(parse_shortcut("Meta+A+B").is_err());
+        assert!(parse_shortcut("Meta").is_err());
     }
 
     #[test]

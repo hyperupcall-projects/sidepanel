@@ -9,13 +9,12 @@ license = "MIT"
 # Wayland client toolkit. `calloop` gives us an event loop we can multiplex with
 # the D-Bus thread.
 #
-# NOTE: keyboard handling (Escape to dismiss) lives behind SCTK's `xkbcommon`
-# feature, which needs the system `libxkbcommon-dev` package. It is left out of
-# the MVP so the project builds on a stock system; see README for how to add it.
-smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop"] }
+# Keyboard capture uses the compositor's keymap through libxkbcommon.
+smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop", "xkbcommon"] }
 calloop = "0.14"
 calloop-wayland-source = "0.4"
 wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 
 # KGlobalAccel (KDE's global-shortcut broker) is spoken over D-Bus.
 zbus = { version = "5", features = ["blocking-api"] }
@@ -25,6 +24,22 @@ toml = "0.8"
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
+# Embedded browser (separate pre-warmed window). wry 0.57 targets WebKitGTK
+# via gtk3, so the `gtk` crate must stay on 0.18 to match (`gtk-sys` conflicts
+# otherwise). Needs the system packages libwebkit2gtk-4.1-dev + libgtk-3-dev.
+wry = "0.57.0"
+gtk = "0.18"
+# Native navigation policies distinguish link clicks from redirects/reloads.
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
+
+# Panel text rendering (software-rasterised with a system font).
+fontdue = "0.9.4"
+
+# Favicon fetching/decoding: blocking HTTP, raster decoders, SVG renderer.
+ureq = "3.4.2"
+image = { version = "0.25.10", default-features = false, features = ["png", "ico", "jpeg", "gif", "webp"] }
+resvg = "0.48.1"
+url = "2.5.8"
 
 # Startup latency matters for a launcher: a smaller, LTO'd binary loads faster.
 [profile.release]

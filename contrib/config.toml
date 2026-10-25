@@ -2,17 +2,60 @@
 # Copy to: $XDG_CONFIG_HOME/sidepanel/config.toml  (usually ~/.config/sidepanel/config.toml)
 # Every field is optional; omitted fields use the defaults shown here.
 
-# Which screen edge to anchor the panel to: "left" or "right".
-side = "left"
+# Four independent edge thicknesses in logical pixels (also in Settings).
+# Left/right: 48-800 px; top/bottom: 40-400 px.
+# Corner boxes inherit width from the adjacent side and height from the
+# adjacent top/bottom edge. Panels stop before the corner boxes.
+# The legacy `width` key is still accepted as `left_width`; `side` is ignored.
+left_width = 64
+right_width = 64
+top_height = 64
+bottom_height = 64
 
-# Panel width in logical pixels. Height always fills the screen.
-width = 150
+# Appearance preference: "light", "dark", or "system" (follows the desktop).
+theme = "system"
+
+# Floating-panel appearance (also adjustable in Settings).
+# Shared margin between every piece and the screen edges: 0-80 px; corner radius: 0-48 px; opacity: 20-100%.
+# 100% opacity means no transparency.
+margin = 12
+border_radius = 16
+opacity = 100
+
+# Dim the desktop behind the frame while shown: 0-100%, default 20%.
+# 0 disables dimming; 100 makes the backdrop black. Gaps remain clickable.
+# Independent of panel opacity; adjustable in Settings in 5% steps.
+desktop_dim = 20
 
 # Global shortcut, as Modifier+Key. Modifiers: Meta/Super/Logo/Win, Ctrl,
 # Alt, Shift. Keys: a-z, 0-9, space, escape, tab, return, backspace, delete,
 # home, end, left/up/right/down, pageup, pagedown, f1-f12.
 #
+# You can rebind this in the panel Settings UI without restarting.
 # This is only the *default*: once registered it also appears in
 # System Settings -> Shortcuts, where the user can rebind it. A user-set
 # binding is respected on subsequent launches.
+#
+# Pressing the shortcut dismisses any browser window the panel opened.
 shortcut = "Meta+F"
+
+# Default browser window size (640-3840 x 400-2160). Also adjustable from
+# the bottom-left corner box (gear); changing it there REWRITES this file, so
+# hand-written comments are not preserved.
+browser_width = 1280
+browser_height = 800
+
+# Websites listed in the panel's "Websites" drop-down, in order. When this
+# section is omitted entirely, the two localhost entries below are used.
+# Each row shows the site's favicon (fetched in the background) and clicking
+# it opens the URL in the pre-warmed browser window.
+#
+# `title` is optional; without it the host is shown (e.g. "localhost:6005").
+
+[[websites]]
+url = "http://localhost:6005/"
+title = "Dev 6005"
+
+[[websites]]
+url = "http://localhost:6006/"
+title = "Dev 6006"

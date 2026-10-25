@@ -73,12 +73,15 @@ if [ "$UNINSTALL" = 1 ]; then
 fi
 
 # --- build -----------------------------------------------------------------
+# Always rebuild: a stale binary in target/release would otherwise be installed
+# verbatim, and a stale D-Bus client can fail against the running service (for
+# example a mismatched KGlobalAccel method name).
+command -v cargo >/dev/null 2>&1 || die "cargo not found; it is required to build ${PROG}"
+info "building release binary"
+( cd "$REPO_ROOT" && cargo build --release )
+
 BUILT="${REPO_ROOT}/target/release/${PROG}"
-if [ ! -x "$BUILT" ]; then
-  command -v cargo >/dev/null 2>&1 || die "no binary at ${BUILT} and cargo is not installed"
-  info "building release binary"
-  ( cd "$REPO_ROOT" && cargo build --release )
-fi
+[ -x "$BUILT" ] || die "build did not produce ${BUILT}"
 
 # --- install binary --------------------------------------------------------
 install -d "$BINDIR"

@@ -1,5 +1,45 @@
 # sidepanel — implementation notes
 
+The current launcher renders four edge panels and four corner boxes inside
+one transparent, output-sized layer surface. `src/frame.rs` computes the eight
+rectangles for the renderer, pointer hits, and Wayland input region, so the
+desktop remains accessible through the center and gaps. The bottom-left box
+opens a separate settings overlay on the same output. The earlier single
+sidebar implementation described below is retained as design history.
+
+Dimming uses a separate `Layer::Top` surface, filled with premultiplied black
+controlled by `desktop_dim` (0–100 percent, default 20), with an empty input
+region and no keyboard focus. Cards live in a transparent `Layer::Overlay`
+surface. Keeping the backdrop out of the cards' canvas is essential: otherwise
+the overlay dims ordinary browser windows beneath it.
+
+KWin supports exporting layer-shell surfaces as toplevel equivalents through
+`zxdg_exporter_v2`. The backdrop is exported and its handle sent to the GTK
+browser helper. GTK's `gdk_wayland_window_set_transient_for_exported` imports
+it, giving KWin a stacking constraint: backdrop below browser, with the overlay
+cards and settings above both. See KWin's [foreign surface handling](https://github.com/KDE/kwin/blob/master/src/wayland/xdgforeign_v2.cpp)
+and [transient stacking constraints](https://github.com/KDE/kwin/blob/master/src/window.cpp).
+The compositor tracks placement, so browser movement and resizing need no
+geometry polling or transparent holes. The GTK import is reapplied to resized
+windows and restarted helpers. An early navigation request waits for the
+exported handle; hiding cancels any pending request and destroys the export.
+All surfaces share the frame's actual output. Without `xdg-foreign`, the
+launcher disables dimming and continues to open the browser normally.
+
+After navigation the cards accept keyboard focus on demand, allowing browser
+typing. Opening the launcher and recording a shortcut retain exclusive focus.
+Opaque card colors remain unchanged, the gaps pass pointer input through, and
+hiding the frame removes its backdrop. Settings changes persist immediately.
+
+`left_width`, `right_width`, `top_height`, and `bottom_height` independently
+control edge thicknesses. Each corner inherits its adjacent width and height.
+For an output width `W` and shared margin `m`, horizontal edges span
+`W - left_width - right_width - 4*m`; vertical edges use the corresponding
+height formula. Two margins inset the frame and two separate the edge panels
+from their corner boxes. Opposing dimensions shrink proportionally on small
+outputs, and the settings overlay scales to fit while keeping hit coordinates
+aligned. The old config `width` key remains an alias for `left_width`.
+
 How the two hard parts of this app were built: **(1)** getting a global keyboard
 shortcut on KDE Plasma Wayland, and **(2)** putting a full-height panel on screen
 with as little latency as possible. Each part covers the approach, the mistakes
@@ -574,6 +614,13 @@ full-height keyboard-grabbing surface could trap the user. It does not: KWin's
 `isKeyboardShortcutsInhibited()` is set, and a layer surface does not set it. So
 **Meta+F always dismisses the panel** — you cannot get stuck.
 
+Opening the panel selects the first website (`Ui::select_first`) and expands
+the list. **Alt+J** / **Alt+K** move that selection down and up through the
+rows still present in `layout` (so clipped overflow rows are skipped), and
+**Enter** activates the selected row through the same `App::activate` path as
+a click. Repeats of Alt+J/K keep moving; Enter does not retrigger. Shortcut
+recording still owns the keyboard while it is active.
+
 (Note: in KWin's layer-shell implementation `acceptsFocus` is a plain bool, so
 `Exclusive` and `OnDemand` behave identically there.)
 
@@ -612,12 +659,161 @@ event_loop
 
 ---
 
-## Summary of the two mechanisms
+## Part 3 — Websites: favicons, hit-testing, pre-warmed browser
 
-| | Shortcut | Presentation |
-| --- | --- | --- |
-| Protocol | `org.kde.KGlobalAccel` over D-Bus | `zwlr_layer_shell_v1` |
-| Key type | `QKeySequence` = `(ai)`, **exactly 4 ints** | `LayerSurface` + `wl_shm` buffer |
-| The trap | a short array aborts the receiver (KWin) | drawing before `configure` |
-| Reliability choice | `SetPresent` + autoloading | fresh surface per show |
-| Latency strategy | long-running daemon, no spawn | one configure round-trip |
+### 3.1 The problem
+The panel must show real content — a "Websites" drop-down whose rows open in
+a browser — while keeping the launcher's promise: everything instant, nothing
+spawned or mapped on click.
+
+### 3.2 One layout for both pixels and clicks
+`panel::layout(width, ui, sites)` computes the clickable `Hit` rects (header
+row + one row per site while expanded). The renderer (`panel::draw`) and the
+pointer hit-testing (`panel::hit_test`) both consume it, so what is drawn is
+exactly what is clickable — they cannot drift apart
+(the layout and hit-test share one `hits` slice so they cannot drift apart).
+
+Input arrives through sctk's `SeatHandler` / `PointerHandler`: `get_pointer`
+when the seat advertises `Capability::Pointer`, then aggregated
+`pointer_frame` events (Enter/Motion/Press/Release). Motion updates a hover
+highlight and repaints; `Press` with `BTN_LEFT` (0x110) dispatches to
+`App::activate` — toggle the drop-down, or open a site.
+
+### 3.3 Favicons
+A background thread GETs each configured site once: the page (512 KiB cap),
+scan `<link rel="icon" href="...">` (case-insensitive; the href keeps its
+original casing), then fall back to `/favicon.ico`. Raster formats decode via
+`image` (PNG/ICO/JPEG/GIF/WebP), SVG via `resvg` (system fonts loaded for SVG
+text). Results return over a calloop channel; rows draw a globe placeholder
+until their icon arrives.
+
+**Pitfall — byte order.** Wayland `ARGB8888` buffers are *premultiplied* with
+bytes `[B, G, R, A]` (little-endian u32); decoders emit straight `[R, G, B,
+A]`. Icons are premultiplied on ingest and R/B-swapped when blitted — miss
+either and a red favicon renders blue. `render_sample_panel_png` renders the
+real panel headlessly to `/tmp/panel_render.png`, which caught exactly this.
+
+### 3.4 Text
+`fontdue` rasterises glyphs from a font chosen at startup (common system
+paths, then `fc-match`); no system text API is involved at draw time.
+Placement pitfall: fontdue's `ymin` is the bitmap's **bottom** edge above the
+baseline, so the glyph's top-left is `baseline - ymin - height`.
+
+### 3.5 The browser: a separate, pre-warmed process
+At startup the panel spawns `sidepanel --browser` (same binary; GTK runs on
+the helper's main thread). The helper builds a `gtk::Window` + wry/WebKitGTK
+webview at `about:blank`, calls `realize()`, then `show(); hide();` **before
+pumping a single GTK event** — the widget tree (and best effort the WebKit
+web process) is warm, yet no Wayland commit ever maps the window: nothing
+flashes and no page loads. `delete-event` hides instead of destroying,
+keeping the view warm across closes.
+
+Clicks write `"<title>\t<url>\n"` to the helper's stdin; a reader thread
+feeds the GTK loop through a channel (so stdin never starves GTK). On a
+command the helper `present()`s first — instant visibility — and only then
+`load_url`s. The helper exits when stdin closes (panel gone); a crashed
+helper is restarted on the next click.
+
+The native WebKitGTK `decide-policy` handler routes clicked HTTP(S) links by
+comparing the destination hostname with the current page's hostname. A different
+host opens with `xdg-open` on a worker thread, leaving the embedded page intact;
+same-host links stay in the view, including links requesting a new window.
+Subdomains count as separate hosts. Redirects, forms, reloads, and programmatic
+bookmark loads keep WebKit's default policy so initial navigation and sign-in
+redirects still work. The worker waits for `xdg-open` to reap it and logs failures.
+
+**Pitfall — why a separate process.** WebKitGTK *aborts* its host process
+(glib `G_LOG_LEVEL_ERROR` is always fatal) when its helper binaries are
+missing (`…/webkit2gtk-4.1/WebKitNetworkProcess`: "Unable to spawn a new
+child process"). This is not hypothetical — it killed the panel on the first
+live run. The panel therefore probes for the helpers before spawning and logs
+`browser disabled: WebKitGTK runtime not found` instead of ever risking the
+daemon; the helper re-checks defensively before touching GTK.
+
+### 3.6 Settings steppers and Meta+F dismissal
+
+The panel's fixed bottom **Settings** button toggles a separate bottom-left
+layer surface, offset to the right of a left-anchored sidebar on the same output.
+It closes with the sidebar, the footer button, or its close button. A right-anchored
+sidebar keeps settings at the bottom-left of the output. The settings surface offers
+Light/Dark/System choices, saved as `theme` (default `system`), and renders `− Width +` / `− Height +` rows.
+Each stepper row is laid out as two half-hits; either half highlights the
+whole row, and the value label is painted exactly once (by the left half).
+Clicks step by 40 px within 640–3840 × 400–2160, persist with `Config::save`,
+and send `size <w> <h>` to the helper.
+
+**Pitfall — resizing on Wayland.** Clients cannot resize their own toplevels,
+so `gtk_window_resize` is a no-op. The helper instead *rebuilds* its
+(usually hidden) window at the new size — and only re-presents/reloads the
+last URL if the window was visible when the size changed.
+
+`Config::save` is a full TOML rewrite: `browser_width`/`browser_height` are
+declared **before** `[[websites]]` because TOML requires scalar values to
+precede tables, and `title` skips `None`. `default_config_round_trips` pins
+this. Side effect worth knowing: hand-written comments in the config file
+are lost once the Settings UI saves.
+
+`theme::spawn` subscribes to XDG Settings portal `SettingChanged` events before
+reading `org.freedesktop.appearance/color-scheme` with `ReadAll`. A value of 1
+selects dark; other values or an unavailable portal fall back to light. Appearance
+updates travel through calloop and repaint both surfaces when System is selected.
+Both surfaces share an explicit light/dark palette for text, backgrounds, hover,
+selection, dividers, and placeholder icons.
+
+**Meta+F dismisses too.** `App::toggle` calls `Browser::dismiss` (a `hide`
+line) before showing or hiding the panel — summoning starts clean, hiding
+takes the browser with it. The helper just `window.hide()`s: the view stays
+warm, and the helper process only exits when the panel goes away (stdin
+EOF) or crashes (then the next click respawns it at the configured size).
+
+### 3.7 Verifying it
+- Unit: `keyboard_selection_starts_at_first_and_stops_at_ends`;
+  `render_sample_panel_png` renders the
+  headless panel (font, icon, hover, ellipsis) to a PNG for eyeballing.
+- Live: `ydotool` (over uinput) injects `Super+F` and `BTN_LEFT`, proving
+  show → Enter/Motion → `press -> Open(1)` → `panel: opening …` end to end;
+  the `pointer_frame` TRACE log shows per-event surface matching.
+
+---
+
+## Summary of the three mechanisms
+
+| | Shortcut | Presentation | Browser |
+| --- | --- | --- | --- |
+| Protocol | `org.kde.KGlobalAccel` over D-Bus | `zwlr_layer_shell_v1` | stdin lines to a pre-spawned helper process |
+| Key type | `QKeySequence` = `(ai)`, **exactly 4 ints** | `LayerSurface` + `wl_shm` buffer | `"<title>\t<url>\n"` |
+| The trap | a short array aborts the receiver (KWin) | drawing before `configure` | WebKitGTK aborts its host process |
+| Reliability choice | `SetPresent` + autoloading | fresh surface per show | process isolation + probe + respawn |
+| Latency strategy | long-running daemon, no spawn | one configure round-trip | window pre-warmed at startup, shown before it loads |
+
+### Floating panel appearance
+
+The default sidebar width is 200 logical pixels. `margin` (default 12),
+`border_radius` (default 16), and `opacity` (default 100 percent) are saved
+scalar config fields shared by the sidebar and settings surface. Settings
+steppers update both surfaces immediately. Layer-shell margins expose the
+desktop around the sidebar, while the settings card stays on the same output
+and is offset by sidebar width plus two margins on the left. Changing margins
+commits new geometry on the existing surfaces. Config loading bounds margin
+to 0–80, radius to 0–48, and opacity to 20–100.
+
+After content rendering, `finish_surface` clips rounded corners with subpixel
+coverage and scales all BGRA channels together for premultiplied ARGB opacity.
+At 100 percent the interior remains opaque; at radius zero corners are square.
+
+### Shortcut recording and live rebinding
+
+SCTK's `xkbcommon` feature supplies keyboard events using the compositor keymap.
+The settings shortcut button enters recording mode; modifier-only and repeat
+presses are ignored, Escape cancels, and a supported key with Ctrl/Alt/Meta
+submits a request. Closing settings, hiding the sidebar, losing keyboard focus,
+or losing the keyboard cancels recording. Pending requests disable recording.
+
+The KGlobalAccel listener shares its registering D-Bus connection with a worker
+that serializes rebind requests. The worker checks `globalShortcutAvailable`,
+snapshots `shortcutKeys`, sets `setShortcutKeys` with SetPresent | NoAutoloading,
+and verifies the returned key sequences. A rejected result restores the previous
+keys. Each sequence retains the four-int wire format. Successful results travel
+through calloop before config persistence; failures display in settings. Startup
+uses autoloading and displays the binding returned by KDE. Recording and pending
+states suppress the global toggle so capture does not dismiss the sidebar.
