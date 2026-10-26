@@ -11,8 +11,9 @@ move down, **Alt+K** to move up, and **Enter** to open the highlighted website.
 Navigation stops at the first and last visible entries; holding Alt+J or Alt+K
 repeats the movement.
 
-The panel shows a **Websites** section: a drop-down list of the sites from your
-config, each row showing the site's favicon on the left. Clicking a row opens
+The panel starts with a **Websites** section in the left rectangle. Each of
+the four rectangles can contain sections of website links, with a favicon on
+each entry. Clicking a row opens
 the site in a separate browser window that is **pre-warmed at startup** —
 created hidden on `about:blank`, so the window appears immediately on the
 first click while loading nothing until then.
@@ -25,8 +26,20 @@ hostnames; automatic redirects and sign-in flows continue normally.
 
 Click the **gear in the bottom-left corner box** to open settings just above
 and to the right of that box. Click the box again or the settings close button
-to dismiss it. The website list remains in the left edge panel; the other edge
-panels and corner boxes are empty cards for now.
+to dismiss it. Choose **Contents**, then **Left**, **Right**, **Top**, or
+**Bottom** to customize that rectangle. Add or remove sections, edit a section
+name and click **Rename**, and add or remove websites in each section. Each
+website has separate **Title** and **URL** fields; click **Save website** (or
+**Add website** for a new entry) to apply them. A blank title uses the URL's
+host. URLs must start with `http://` or `https://`. Changes appear immediately
+and are saved to your config. Corner-box contents stay fixed.
+
+The editor supports Tab/Shift+Tab, arrow keys, Home/End, Ctrl+A, and Enter to
+save the active form. **Ctrl+V** pastes text when `wl-paste` from the optional
+`wl-clipboard` package is installed. Section and website lists have page
+controls, and rectangle rails show arrow buttons when their content overflows.
+Top and bottom rectangles lay out links horizontally; side rectangles lay them
+out vertically.
 
 Settings has independent **Left width**, **Right width**, **Top height**, and
 **Bottom height** controls. Each corner box takes its width from the adjacent
@@ -57,6 +70,14 @@ resizes, and reopening. Panels and settings stay above the browser.
 System mode follows live desktop changes through the
 [XDG Settings portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.Settings.html),
 using light mode when no preference is available.
+
+**Panel opening** in Settings offers **Desktop Default** (the default, leaving
+animation to KWin), **Fade In**, and **Instant**. Fade In changes opacity at the
+final size, with a **Fade duration** control from 0–5000 ms in 25 ms steps
+(default 150 ms; 0 is immediate). The config accepts any whole millisecond
+value in that range. Changes are saved immediately and apply the next time
+the frame or settings card opens. The backdrop shares the frame's fade.
+The separate browser window retains the desktop's normal animation.
 
 Pressing **Meta+F** again dismisses the frame, settings, and any browser window
 it opened. The browser is only hidden, so the next bookmark click is just as fast.
@@ -172,6 +193,8 @@ margin = 12        # 0-80 px shared gap between pieces and screen edges
 border_radius = 16 # 0-48 px rounded corners
 opacity = 100      # 20-100%; 100 means no transparency
 desktop_dim = 20   # 0-100%; 0 disables desktop dimming
+panel_animation = "desktop_default" # "desktop_default", "fade_in", or "instant"
+fade_duration_ms = 150 # 0-5000 ms; used by "fade_in"
 shortcut = "Meta+F"
 theme = "system"   # "light", "dark", or "system"
 
@@ -180,18 +203,24 @@ theme = "system"   # "light", "dark", or "system"
 browser_width = 1280
 browser_height = 800
 
-[[websites]]       # the "Websites" drop-down, in order
+[[sections]]
+rectangle = "left" # "left", "right", "top", or "bottom"
+title = "Websites"
+
+[[sections.websites]]
 url = "http://localhost:6005/"
 title = "Dev 6005" # optional; defaults to the host, e.g. "localhost:6005"
 
-[[websites]]
+[[sections.websites]]
 url = "http://localhost:6006/"
 ```
 
 The legacy `width` key is accepted as `left_width`; the obsolete `side` key is
 ignored because all four edges are now shown. Saving settings writes the new
-keys. When the `[[websites]]` section is omitted, the two localhost entries above
-are used. Favicons are fetched in the background — the page's
+keys. Legacy `[[websites]]` entries are read into a left-side **Websites** section
+and saved in the new format. When both `sections` and legacy `websites` are
+omitted, the two localhost entries above are used. Set `sections = []` before
+any tables for an empty frame. Favicons are fetched in the background — the page's
 `<link rel="icon">` first, then `/favicon.ico`; PNG/ICO/JPEG/GIF/WebP and SVG
 are all supported — and each row shows a globe placeholder until its icon
 arrives. See `contrib/config.toml` for the annotated example.

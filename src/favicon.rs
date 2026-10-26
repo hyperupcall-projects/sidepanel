@@ -1,6 +1,6 @@
 //! Favicon fetching for the configured websites.
 //!
-//! A background thread walks the site list once at startup:
+//! Background threads walk new URLs at startup and after content edits:
 //!
 //!   1. GET the page (capped) and look for `<link rel="icon" href="...">` —
 //!      dev servers and SPAs usually declare their icon there;
@@ -21,6 +21,7 @@ use url::Url;
 pub const ICON: u32 = 16;
 
 /// A decoded icon: RGBA8 pixels, **premultiplied** alpha, row-major.
+#[derive(Clone)]
 pub struct Icon {
     pub w: u32,
     pub h: u32,
@@ -29,7 +30,7 @@ pub struct Icon {
 
 /// Result reported by the fetch thread.
 pub enum Event {
-    Ready { index: usize, icon: Option<Icon> },
+    Ready { url: String, icon: Option<Icon> },
 }
 
 const PAGE_LIMIT: u64 = 512 * 1024;
@@ -42,9 +43,15 @@ pub fn spawn(sites: Vec<String>, tx: calloop::channel::Sender<Event>) {
         .name("favicons".into())
         .spawn(move || {
             let agent = agent();
-            for (index, url) in sites.iter().enumerate() {
+            for url in &sites {
                 let icon = fetch(&agent, url);
-                if tx.send(Event::Ready { index, icon }).is_err() {
+                if tx
+                    .send(Event::Ready {
+                        url: url.clone(),
+                        icon,
+                    })
+                    .is_err()
+                {
                     return; // panel is gone
                 }
             }

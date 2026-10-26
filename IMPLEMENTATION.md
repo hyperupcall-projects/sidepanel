@@ -7,6 +7,46 @@ desktop remains accessible through the center and gaps. The bottom-left box
 opens a separate settings overlay on the same output. The earlier single
 sidebar implementation described below is retained as design history.
 
+Settings now has Appearance and Contents tabs. `Config::sections` stores ordered
+`Section { rectangle, title, websites }` records for the four edge rectangles;
+the `Rectangle` enum excludes corners. `Config::parse` migrates legacy top-level
+`[[websites]]` into the left rectangle's Websites section. Explicitly empty
+sections remain empty. Saves use `[[sections]]` / `[[sections.websites]]`.
+
+`src/editor.rs` owns section/website selection, paginated lists, separate name,
+title and URL drafts, UTF-8 cursor input, and HTTP/HTTPS validation. Rename and
+Save/Add website commit drafts; structural add/remove actions persist immediately.
+The renderer shares content and scaled settings geometry with pointer hits.
+Vertical rails flow downward; horizontal rails flow rightward. Overflow arrows
+step through all entries, and each section collapses independently. Website
+indices are flattened across sections for keyboard selection and favicon slots.
+Favicon events identify URLs, so a result for a deleted/replaced entry cannot
+be assigned to an unrelated row. Existing URL icons survive content edits.
+
+The frame keeps keyboard focus while settings is open. Editor keystrokes are
+consumed before launcher activation and shortcut recording. Optional Ctrl+V
+uses `src/clipboard.rs` to invoke `wl-paste` off the event loop, with bounded
+input and a two-second timeout. Replies carry a field and editor revision so
+late results cannot paste into a different draft. No additional Rust dependency
+is needed; users without wl-clipboard can still type and edit all fields.
+
+`panel_animation` selects Desktop Default, Fade In, or Instant for the layer
+surfaces. Desktop Default retains the original namespaces and delegates to
+KWin. Custom modes use the layer-shell namespace `dock`, which KWin maps to
+its Dock window type, excluded by its standard Scale, Fade, and Fading Popups
+effects. This is KDE-specific; other compositors and third-party effects may
+interpret the namespace differently. See KWin's
+[namespace mapping](https://github.com/KDE/kwin/blob/Plasma/6.3/src/layershellv1window.cpp).
+Layer, exclusive zone, keyboard interactivity, and input regions are unchanged.
+`src/animation.rs` implements a linear opacity ramp over `fade_duration_ms`
+(default 150, clamped to 0–5000). All premultiplied channels are scaled, leaving
+geometry and transparent gaps intact. Each surface snapshots its animation
+settings when created, starts on its first buffer, requests one Wayland frame
+callback at a time, and stops requesting callbacks after reaching full opacity.
+The backdrop clones the frame's timeline; settings starts its own. Hiding
+destroys the surfaces, so late callbacks cannot animate a reopened panel.
+The browser helper is unaffected. Settings changes apply on the next open.
+
 Dimming uses a separate `Layer::Top` surface, filled with premultiplied black
 controlled by `desktop_dim` (0–100 percent, default 20), with an empty input
 region and no keyboard focus. Cards live in a transparent `Layer::Overlay`

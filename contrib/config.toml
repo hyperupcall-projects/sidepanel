@@ -27,6 +27,14 @@ opacity = 100
 # Independent of panel opacity; adjustable in Settings in 5% steps.
 desktop_dim = 20
 
+# Layer-panel opening: "desktop_default", "fade_in", or "instant".
+# Desktop Default leaves animation to KWin. Custom modes skip its standard
+# opening effects; Fade In changes opacity at the final size. Browser windows
+# keep the desktop's animation. Changes apply the next time a surface opens.
+panel_animation = "desktop_default"
+# Fade duration: 0-5000 ms (0 is immediate); Settings steps by 25 ms.
+fade_duration_ms = 150
+
 # Global shortcut, as Modifier+Key. Modifiers: Meta/Super/Logo/Win, Ctrl,
 # Alt, Shift. Keys: a-z, 0-9, space, escape, tab, return, backspace, delete,
 # home, end, left/up/right/down, pageup, pagedown, f1-f12.
@@ -45,17 +53,24 @@ shortcut = "Meta+F"
 browser_width = 1280
 browser_height = 800
 
-# Websites listed in the panel's "Websites" drop-down, in order. When this
-# section is omitted entirely, the two localhost entries below are used.
-# Each row shows the site's favicon (fetched in the background) and clicking
-# it opens the URL in the pre-warmed browser window.
-#
-# `title` is optional; without it the host is shown (e.g. "localhost:6005").
+# Rectangle contents (also editable in Settings -> Contents).
+# Each section belongs to "left", "right", "top", or "bottom". Corner-box
+# contents are fixed. Repeat [[sections]] to add more sections, followed by
+# that section's [[sections.websites]] entries. Sections may have no websites.
+# With neither sections nor legacy websites present, the default left-side
+# Websites section contains the two localhost URLs below. To start empty,
+# set sections = [] above any tables instead of defining sections below.
+# Legacy [[websites]] entries still load into a left-side Websites section.
+# `title` on a website is optional; without it the host is shown.
 
-[[websites]]
+[[sections]]
+rectangle = "left"
+title = "Websites"
+
+[[sections.websites]]
 url = "http://localhost:6005/"
 title = "Dev 6005"
 
-[[websites]]
+[[sections.websites]]
 url = "http://localhost:6006/"
 title = "Dev 6006"

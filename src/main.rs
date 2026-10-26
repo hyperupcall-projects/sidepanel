@@ -8,8 +8,11 @@
 //!
 //! Wayland only. There is deliberately no X11 path.
 
+mod animation;
 mod browser;
+mod clipboard;
 mod config;
+mod editor;
 mod favicon;
 mod frame;
 mod hotkey;
@@ -23,7 +26,7 @@ use anyhow::{anyhow, Context, Result};
 use calloop::EventLoop;
 use calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState, Region},
+    compositor::{CompositorHandler, CompositorState, FrameCallbackData, Region},
     delegate_registry,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
@@ -86,12 +89,8 @@ fn main() -> Result<()> {
     // panel font up front.
     let browser = browser::Browser::start(config.browser_width, config.browser_height);
     let font = text::TextRenderer::load();
-    let labels: Vec<String> = config.websites.iter().map(|site| site.label()).collect();
-    let favicon_targets: Vec<String> = config
-        .websites
-        .iter()
-        .map(|site| site.url.clone())
-        .collect();
+    let labels: Vec<String> = config.websites().map(|site| site.label()).collect();
+    let favicon_targets: Vec<String> = config.websites().map(|site| site.url.clone()).collect();
     let icons: Vec<Option<favicon::Icon>> = (0..labels.len()).map(|_| None).collect();
 
     let conn = Connection::connect_to_env()
@@ -139,6 +138,10 @@ fn main() -> Result<()> {
         ui: panel::Ui::default(),
         labels,
         icons,
+        icon_urls: favicon_targets.clone(),
+        favicon_sender: None,
+        clipboard_sender: None,
+        editor_revision: 0,
         font,
         browser,
     };
@@ -161,7 +164,28 @@ fn main() -> Result<()> {
             }
         })
         .map_err(|err| anyhow!("failed to insert the favicon event source: {err:?}"))?;
+    app.favicon_sender = Some(fav_tx.clone());
     favicon::spawn(favicon_targets, fav_tx);
+
+    let (clipboard_tx, clipboard_channel) = calloop::channel::channel::<clipboard::Event>();
+    handle
+        .insert_source(clipboard_channel, |event, _, app| {
+            if let calloop::channel::Event::Msg(event) = event {
+                if app.ui.settings_open
+                    && app.ui.contents_tab
+                    && app.editor_revision == event.revision
+                    && app.ui.editor.focus == Some(event.field)
+                {
+                    match event.text {
+                        Ok(text) => app.ui.editor.input_mut(event.field).insert(&text),
+                        Err(message) => app.ui.editor.message = message,
+                    }
+                    app.draw();
+                }
+            }
+        })
+        .map_err(|err| anyhow!("failed to insert clipboard event source: {err:?}"))?;
+    app.clipboard_sender = Some(clipboard_tx);
 
     let (theme_tx, theme_channel) = calloop::channel::channel::<bool>();
     handle
@@ -240,6 +264,8 @@ struct Panel {
     width: u32,
     height: u32,
     configured: bool,
+    opening: animation::Opening,
+    frame_pending: bool,
 }
 
 struct App {
@@ -266,10 +292,14 @@ struct App {
     shortcut_requests: Option<std::sync::mpsc::Sender<String>>,
     /// Drop-down / hover state of the panel content.
     ui: panel::Ui,
-    /// Row labels, parallel to `config.websites`.
+    /// Row labels, parallel to the flattened section websites.
     labels: Vec<String>,
     /// Favicons as they arrive from the background fetch.
     icons: Vec<Option<favicon::Icon>>,
+    icon_urls: Vec<String>,
+    favicon_sender: Option<calloop::channel::Sender<favicon::Event>>,
+    clipboard_sender: Option<calloop::channel::Sender<clipboard::Event>>,
+    editor_revision: u64,
     /// System font for panel text (absent = draw without text).
     font: Option<text::TextRenderer>,
     /// Pre-warmed browser helper process.
@@ -298,7 +328,7 @@ impl App {
             &qh,
             surface,
             Layer::Overlay,
-            Some("sidepanel"),
+            Some(self.config.panel_animation.namespace("sidepanel")),
             None,
         );
 
@@ -318,6 +348,11 @@ impl App {
             width: 0,
             height: 0,
             configured: false,
+            opening: animation::Opening::new(
+                self.config.panel_animation,
+                self.config.fade_duration_ms,
+            ),
+            frame_pending: false,
         });
         if self.exporter.is_some() {
             self.browser.wait_for_parent();
@@ -329,6 +364,8 @@ impl App {
     /// Dropping the `LayerSurface` destroys the underlying `wl_surface`, which
     /// unmaps it.
     fn hide(&mut self) {
+        self.editor_revision = self.editor_revision.wrapping_add(1);
+        self.ui.editor.focus = None;
         self.browser.dismiss();
         self.browser.clear_parent();
         if let Some(exported) = self.backdrop_export.take() {
@@ -354,12 +391,17 @@ impl App {
         if self.backdrop.is_some() {
             return;
         }
+        let Some(frame) = &self.panel else {
+            return;
+        };
+        // The backdrop joins the frame's timeline, even if its configure is late.
+        let opening = frame.opening.clone();
         let surface = self.compositor_state.create_surface(&self.qh);
         let layer = self.layer_shell.create_layer_surface(
             &self.qh,
             surface,
             Layer::Top,
-            Some("sidepanel-backdrop"),
+            Some(opening.mode.namespace("sidepanel-backdrop")),
             Some(output),
         );
         layer.set_size(0, 0);
@@ -378,6 +420,8 @@ impl App {
             width: 0,
             height: 0,
             configured: false,
+            opening,
+            frame_pending: false,
         });
     }
 
@@ -434,7 +478,7 @@ impl App {
             &self.qh,
             surface,
             Layer::Overlay,
-            Some("sidepanel-settings"),
+            Some(self.config.panel_animation.namespace("sidepanel-settings")),
             output.as_ref(),
         );
         layer.set_size(width, height);
@@ -449,6 +493,11 @@ impl App {
             width,
             height,
             configured: false,
+            opening: animation::Opening::new(
+                self.config.panel_animation,
+                self.config.fade_duration_ms,
+            ),
+            frame_pending: false,
         });
     }
 
@@ -463,7 +512,12 @@ impl App {
     }
 
     fn draw(&mut self) {
+        self.draw_surfaces(None);
+    }
+
+    fn draw_surfaces(&mut self, only: Option<&wl_surface::WlSurface>) {
         let content = panel::Content {
+            config: &self.config,
             labels: &self.labels,
             icons: &self.icons,
             font: self.font.as_ref(),
@@ -476,17 +530,23 @@ impl App {
             border_radius: self.config.border_radius,
             opacity: self.config.opacity,
             desktop_dim: self.config.desktop_dim,
+            panel_animation: self.config.panel_animation,
+            fade_duration_ms: self.config.fade_duration_ms,
             dimensions: self.dimensions(),
         };
+        let now = std::time::Instant::now();
         for (surface, kind) in [
-            (&self.backdrop, SurfaceKind::Backdrop),
-            (&self.panel, SurfaceKind::Frame),
-            (&self.settings, SurfaceKind::Settings),
+            (&mut self.backdrop, SurfaceKind::Backdrop),
+            (&mut self.panel, SurfaceKind::Frame),
+            (&mut self.settings, SurfaceKind::Settings),
         ] {
             let Some(panel) = surface else {
                 continue;
             };
-            if !panel.configured || panel.width == 0 || panel.height == 0 {
+            if !panel.configured || panel.width == 0 || panel.height == 0 || panel.frame_pending {
+                continue;
+            }
+            if only.is_some_and(|surface| surface != panel.layer.wl_surface()) {
                 continue;
             }
             let width = panel.width.max(1);
@@ -511,7 +571,10 @@ impl App {
                     // Let the launched browser take keyboard focus. Clicking a card
                     // can focus the launcher again; shortcut recording stays exclusive.
                     panel.layer.set_keyboard_interactivity(
-                        if self.browser.is_open() && !self.ui.recording_shortcut {
+                        if self.browser.is_open()
+                            && !self.ui.recording_shortcut
+                            && !self.ui.settings_open
+                        {
                             KeyboardInteractivity::OnDemand
                         } else {
                             KeyboardInteractivity::Exclusive
@@ -528,11 +591,17 @@ impl App {
                         .set_input_region(Some(region.wl_region()));
                 }
             }
+            let (opacity, animating) = panel.opening.sample(now);
+            animation::apply_opacity(canvas, opacity);
             let surface = panel.layer.wl_surface();
             surface.damage_buffer(0, 0, width as i32, height as i32);
             buffer
                 .attach_to(surface)
                 .expect("failed to attach the buffer");
+            if animating {
+                surface.frame(&self.qh, FrameCallbackData(surface.clone()));
+                panel.frame_pending = true;
+            }
             panel.layer.commit();
         }
     }
@@ -551,7 +620,7 @@ impl App {
             self.dimensions(),
             self.config.margin,
             &self.ui,
-            self.labels.len(),
+            &self.config.sections,
         );
         if self.modifiers.alt
             && !self.modifiers.ctrl
@@ -578,20 +647,45 @@ impl App {
     /// Act on a click or keyboard activation; returns whether a redraw is needed.
     fn activate(&mut self, action: Action) -> bool {
         match action {
-            Action::Toggle => {
-                self.ui.open = !self.ui.open;
-                log::debug!(
-                    "websites drop-down {}",
-                    if self.ui.open {
-                        "expanded"
-                    } else {
-                        "collapsed"
+            Action::ToggleSection(index) => {
+                if self.ui.collapsed.contains(&index) {
+                    self.ui.collapsed.retain(|&i| i != index);
+                } else {
+                    self.ui.collapsed.push(index);
+                }
+                true
+            }
+            Action::ScrollRectangle(rectangle, delta) => {
+                if let Some(surface) = &self.panel {
+                    let part = match rectangle {
+                        config::Rectangle::Left => frame::Part::Left,
+                        config::Rectangle::Right => frame::Part::Right,
+                        config::Rectangle::Top => frame::Part::Top,
+                        config::Rectangle::Bottom => frame::Part::Bottom,
+                    };
+                    if let Some(rect) = frame::layout(
+                        surface.width,
+                        surface.height,
+                        self.dimensions(),
+                        self.config.margin,
+                    )
+                    .iter()
+                    .find(|r| r.part == part)
+                    {
+                        panel::scroll_rectangle(
+                            rect.w,
+                            rect.h,
+                            &mut self.ui,
+                            &self.config.sections,
+                            rectangle,
+                            delta,
+                        );
                     }
-                );
+                }
                 true
             }
             Action::Open(index) => {
-                let Some(site) = self.config.websites.get(index) else {
+                let Some(site) = self.config.websites().nth(index) else {
                     return false;
                 };
                 let title = self
@@ -604,12 +698,16 @@ impl App {
                 true
             }
             Action::ToggleSettings => {
+                self.editor_revision = self.editor_revision.wrapping_add(1);
                 self.ui.hover = None;
                 self.ui.recording_shortcut = false;
+                self.ui.editor.focus = None;
                 if self.settings.take().is_some() {
                     self.ui.settings_open = false;
                 } else {
                     self.ui.settings_open = true;
+                    let rectangle = self.ui.editor.rectangle;
+                    self.ui.editor.select_rectangle(rectangle, &self.config);
                     self.show_settings();
                 }
                 true
@@ -632,6 +730,22 @@ impl App {
             }
             Action::SetTheme(theme) => {
                 self.config.theme = theme;
+                self.save_config();
+                true
+            }
+            Action::SetPanelAnimation(mode) => {
+                self.config.panel_animation = mode;
+                self.save_config();
+                true
+            }
+            Action::BumpFadeDuration(delta) => {
+                let next = (i64::from(self.config.fade_duration_ms) + i64::from(delta))
+                    .clamp(0, i64::from(config::MAX_FADE_DURATION_MS))
+                    as u32;
+                if next == self.config.fade_duration_ms {
+                    return false;
+                }
+                self.config.fade_duration_ms = next;
                 self.save_config();
                 true
             }
@@ -687,7 +801,136 @@ impl App {
                 );
                 true
             }
+            Action::SettingsContents(_)
+            | Action::SelectRectangle(_)
+            | Action::SelectSection(_)
+            | Action::AddSection
+            | Action::RemoveSection
+            | Action::SaveSection
+            | Action::SectionPage(_)
+            | Action::SelectWebsite(_)
+            | Action::AddWebsite
+            | Action::RemoveWebsite
+            | Action::SaveWebsite
+            | Action::WebsitePage(_)
+            | Action::FocusField(_) => self.edit_contents(action),
         }
+    }
+
+    fn edit_contents(&mut self, action: Action) -> bool {
+        self.editor_revision = self.editor_revision.wrapping_add(1);
+        if let Action::SettingsContents(contents) = action {
+            self.ui.contents_tab = contents;
+            self.ui.editor.focus = None;
+            self.ui.recording_shortcut = false;
+            return true;
+        }
+        if self.ui.editor.apply(action, &mut self.config) {
+            self.ui.collapsed.clear();
+            self.ui.rectangle_scroll = [0; 4];
+            self.ui.selected = None;
+            self.refresh_websites();
+            self.ui.editor.message = match self.config.save() {
+                Ok(()) => "Saved".into(),
+                Err(err) => format!("Could not save: {err}"),
+            };
+        }
+        self.ui.hover = None;
+        true
+    }
+
+    /// Refresh labels and favicon slots after a URL is added, changed or removed.
+    fn refresh_websites(&mut self) {
+        self.labels = self.config.websites().map(|site| site.label()).collect();
+        let old: std::collections::HashMap<_, _> =
+            self.icon_urls.drain(..).zip(self.icons.drain(..)).collect();
+        self.icon_urls = self
+            .config
+            .websites()
+            .map(|site| site.url.clone())
+            .collect();
+        self.icons = self
+            .icon_urls
+            .iter()
+            .map(|url| old.get(url).cloned().flatten())
+            .collect();
+        let targets: std::collections::HashSet<_> = self
+            .icon_urls
+            .iter()
+            .filter(|url| !old.contains_key(*url))
+            .cloned()
+            .collect();
+        if !targets.is_empty() {
+            if let Some(tx) = &self.favicon_sender {
+                favicon::spawn(targets.into_iter().collect(), tx.clone());
+            }
+        }
+    }
+
+    fn editor_key(&mut self, event: &KeyEvent) {
+        use editor::Field;
+        let Some(field) = self.ui.editor.focus else {
+            return;
+        };
+        self.editor_revision = self.editor_revision.wrapping_add(1);
+        if self.modifiers.logo || self.modifiers.alt {
+            return;
+        }
+        let input = self.ui.editor.input_mut(field);
+        if self.modifiers.ctrl {
+            if matches!(event.keysym, Keysym::a | Keysym::A) {
+                input.selected_all = true;
+                input.cursor = input.text.len();
+            } else if matches!(event.keysym, Keysym::v | Keysym::V) {
+                if let Some(tx) = &self.clipboard_sender {
+                    clipboard::paste(self.editor_revision, field, tx.clone());
+                }
+            }
+        } else {
+            match event.keysym {
+                Keysym::BackSpace => input.delete(true),
+                Keysym::Delete => input.delete(false),
+                Keysym::Left => input.move_cursor(false),
+                Keysym::Right => input.move_cursor(true),
+                Keysym::Home => {
+                    input.cursor = 0;
+                    input.selected_all = false;
+                }
+                Keysym::End => {
+                    input.cursor = input.text.len();
+                    input.selected_all = false;
+                }
+                Keysym::Escape => self.ui.editor.focus = None,
+                Keysym::Tab | Keysym::ISO_Left_Tab => {
+                    let fields =
+                        if self.ui.editor.website.is_some() || self.ui.editor.adding_website {
+                            &[Field::SectionName, Field::WebsiteTitle, Field::WebsiteUrl][..]
+                        } else {
+                            &[Field::SectionName][..]
+                        };
+                    let index = fields.iter().position(|&f| f == field).unwrap_or(0);
+                    let next = if self.modifiers.shift {
+                        (index + fields.len() - 1) % fields.len()
+                    } else {
+                        (index + 1) % fields.len()
+                    };
+                    self.ui.editor.focus = Some(fields[next]);
+                }
+                Keysym::Return | Keysym::KP_Enter => {
+                    self.edit_contents(if field == Field::SectionName {
+                        Action::SaveSection
+                    } else {
+                        Action::SaveWebsite
+                    });
+                }
+                _ => {
+                    if let Some(text) = &event.utf8 {
+                        input.insert(text);
+                    }
+                }
+            }
+        }
+        self.draw();
     }
 
     /// Persist the config (best effort — failures are logged, not fatal).
@@ -699,11 +942,12 @@ impl App {
 
     /// Store an arrived favicon and repaint (when the panel is visible).
     fn on_favicon(&mut self, event: favicon::Event) {
-        let favicon::Event::Ready { index, icon } = event;
-        if index >= self.icons.len() {
-            return;
+        let favicon::Event::Ready { url, icon } = event;
+        for (index, target) in self.icon_urls.iter().enumerate() {
+            if target == &url {
+                self.icons[index] = icon.clone();
+            }
         }
-        self.icons[index] = icon;
         self.draw();
     }
 }
@@ -731,10 +975,24 @@ impl CompositorHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        // The panel is static, so we never request frame callbacks.
+        let mut found = false;
+        for panel in [&mut self.panel, &mut self.backdrop, &mut self.settings]
+            .into_iter()
+            .flatten()
+        {
+            if panel.layer.wl_surface() == surface {
+                panel.frame_pending = false;
+                found = true;
+                break;
+            }
+        }
+        if found {
+            self.draw_surfaces(Some(surface));
+        }
+        // A callback for a surface hidden during its fade is harmless.
     }
 
     fn surface_enter(
@@ -950,6 +1208,10 @@ impl KeyboardHandler for App {
         _: u32,
         event: KeyEvent,
     ) {
+        if self.ui.settings_open && self.ui.contents_tab {
+            self.editor_key(&event);
+            return;
+        }
         if !self.ui.recording_shortcut {
             self.launcher_key(event.keysym, false);
             return;
@@ -991,7 +1253,11 @@ impl KeyboardHandler for App {
         _: u32,
         event: KeyEvent,
     ) {
-        self.launcher_key(event.keysym, true);
+        if self.ui.settings_open && self.ui.contents_tab {
+            self.editor_key(&event);
+        } else {
+            self.launcher_key(event.keysym, true);
+        }
     }
     fn release_key(
         &mut self,
@@ -1043,7 +1309,7 @@ impl PointerHandler for App {
                 continue;
             };
             let hits = if is_settings {
-                panel::settings_hits(surface.width, surface.height)
+                panel::settings_hits(surface.width, surface.height, &self.ui, &self.config)
             } else {
                 panel::frame_layout(
                     surface.width,
@@ -1051,7 +1317,7 @@ impl PointerHandler for App {
                     self.dimensions(),
                     self.config.margin,
                     &self.ui,
-                    self.labels.len(),
+                    &self.config.sections,
                 )
             };
             match event.kind {

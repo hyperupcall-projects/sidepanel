@@ -1,6 +1,5 @@
-//! Panel content: a **Websites** section with a drop-down list of the
-//! configured sites (favicon + label on each row) in the left edge panel.
-//! A bottom-left corner box opens settings; the other frame pieces are cards.
+//! Configurable website sections in all four rectangles.
+//! A fixed bottom-left corner box opens appearance and content settings.
 //!
 //! The interactive layout is computed by [`layout`] and shared by the
 //! renderer and the pointer hit-testing, so what you see is exactly what you
@@ -9,7 +8,8 @@
 //! rows, and Enter opens the selected site. Rows render a placeholder globe
 //! until the background favicon fetch reports an [`Icon`].
 
-use crate::config::Theme;
+use crate::config::{Config, PanelAnimation, Rectangle, Section, Theme};
+use crate::editor::{Editor, Field, PAGE_SIZE};
 use crate::favicon::{self, Icon};
 use crate::frame::{self, Part};
 use crate::text::TextRenderer;
@@ -52,11 +52,10 @@ impl Palette {
 }
 
 pub const SETTINGS_WIDTH: u32 = 460;
-pub const SETTINGS_HEIGHT: u32 = 664;
+pub const SETTINGS_HEIGHT: u32 = 784;
 
 const MARGIN: u32 = 10;
 const PAD: u32 = 8;
-const HEADER_H: u32 = 36;
 const ROW_H: u32 = 30;
 const ROW_GAP: u32 = 2;
 const FONT_PX: f32 = 13.0;
@@ -81,13 +80,29 @@ pub enum StyleSetting {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     /// Expand/collapse the website list.
-    Toggle,
+    ToggleSection(usize),
+    ScrollRectangle(Rectangle, i32),
+    SettingsContents(bool),
+    SelectRectangle(Rectangle),
+    SelectSection(usize),
+    AddSection,
+    RemoveSection,
+    SaveSection,
+    SectionPage(i32),
+    SelectWebsite(usize),
+    AddWebsite,
+    RemoveWebsite,
+    SaveWebsite,
+    WebsitePage(i32),
+    FocusField(Field),
     /// Open website `n` (index into the configured list).
     Open(usize),
     /// Open/close the separate settings surface.
     ToggleSettings,
     RecordShortcut,
     SetTheme(Theme),
+    SetPanelAnimation(PanelAnimation),
+    BumpFadeDuration(i32),
     BumpStyle(StyleSetting, i32),
     /// Step the browser window width by `i32` pixels (±`BUMP`).
     BumpWidth(i32),
@@ -128,8 +143,11 @@ impl Hit {
 /// Panel interaction state; persists while the daemon runs (across hide/show).
 #[derive(Debug, Clone)]
 pub struct Ui {
-    /// Is the website list expanded?
-    pub open: bool,
+    /// Collapsed section indices and per-rectangle overflow position.
+    pub collapsed: Vec<usize>,
+    pub rectangle_scroll: [usize; 4],
+    pub contents_tab: bool,
+    pub editor: Editor,
     /// Is the separate settings surface open?
     pub settings_open: bool,
     /// Action under the cursor, if any (drives hover highlighting).
@@ -145,7 +163,10 @@ impl Default for Ui {
     fn default() -> Self {
         // Websites expanded on first run; settings closed until wanted.
         Self {
-            open: true,
+            collapsed: Vec::new(),
+            rectangle_scroll: [0; 4],
+            contents_tab: false,
+            editor: Editor::default(),
             settings_open: false,
             hover: None,
             selected: None,
@@ -158,7 +179,8 @@ impl Default for Ui {
 
 impl Ui {
     pub fn select_first(&mut self, sites: usize) {
-        self.open = true;
+        self.collapsed.clear();
+        self.rectangle_scroll = [0; 4];
         self.hover = None;
         self.selected = (sites > 0).then_some(0);
     }
@@ -193,42 +215,135 @@ impl Ui {
     }
 }
 
-/// Compute the clickable regions for the given width and state.
-pub fn layout(width: u32, height: u32, ui: &Ui, sites: usize) -> Vec<Hit> {
-    if width < 48 || height < MARGIN * 2 + HEADER_H {
+/// Compute section headers and website rows in a rectangle. Horizontal rails
+/// flow left to right; vertical rails flow down. Paging reaches overflow items.
+pub fn layout(
+    width: u32,
+    height: u32,
+    ui: &Ui,
+    sections: &[Section],
+    rectangle: Rectangle,
+) -> Vec<Hit> {
+    if width < 40 || height < 40 {
         return Vec::new();
     }
-    let w = width - MARGIN * 2;
-    let mut hits = Vec::with_capacity(sites + 8);
-    let mut y = MARGIN;
-
-    // "Websites" header + rows.
-    hits.push(Hit {
-        x: MARGIN,
-        y,
-        w,
-        h: HEADER_H,
-        action: Action::Toggle,
-    });
-    y += HEADER_H;
-    if ui.open {
-        y += 6;
-        for n in 0..sites {
-            if y + ROW_H + MARGIN > height {
-                break;
+    let horizontal = matches!(rectangle, Rectangle::Top | Rectangle::Bottom);
+    let mut items = Vec::new();
+    let mut site_index = 0;
+    for (index, section) in sections.iter().enumerate() {
+        if section.rectangle == rectangle {
+            items.push(Action::ToggleSection(index));
+            if !ui.collapsed.contains(&index) {
+                items.extend((site_index..site_index + section.websites.len()).map(Action::Open));
             }
-            hits.push(Hit {
-                x: MARGIN,
-                y,
-                w,
-                h: ROW_H,
-                action: Action::Open(n),
-            });
-            y += ROW_H + ROW_GAP;
+        }
+        site_index += section.websites.len();
+    }
+    let available = if horizontal { width - 20 } else { height - 20 };
+    let nominal_cell = if horizontal { 150 } else { ROW_H + ROW_GAP };
+    let initial_capacity = (available / nominal_cell).max(1) as usize;
+    let controls = if horizontal { 56 } else { 28 };
+    let scrollable = items.len() > initial_capacity && available >= controls + 24;
+    let content_space = available - if scrollable { controls } else { 0 };
+    let cell = nominal_cell.min(content_space);
+    let capacity = (content_space / cell).max(1) as usize;
+    let slot = rectangle as usize;
+    let offset = ui.rectangle_scroll[slot].min(items.len().saturating_sub(capacity));
+    let mut hits = Vec::new();
+    for (i, action) in items.iter().skip(offset).take(capacity).enumerate() {
+        hits.push(Hit {
+            x: if horizontal {
+                MARGIN + i as u32 * cell
+            } else {
+                MARGIN
+            },
+            y: if horizontal {
+                MARGIN
+            } else {
+                MARGIN + i as u32 * cell
+            },
+            w: if horizontal {
+                cell.saturating_sub(4)
+            } else {
+                width - MARGIN * 2
+            },
+            h: if horizontal {
+                height - MARGIN * 2
+            } else {
+                ROW_H.min(cell)
+            },
+            action: *action,
+        });
+    }
+    if scrollable {
+        // Leave room for both controls even on the narrowest rail.
+        if horizontal {
+            for (i, delta) in [-1, 1].into_iter().enumerate() {
+                hits.push(Hit {
+                    x: width - 60 + i as u32 * 26,
+                    y: MARGIN,
+                    w: 24,
+                    h: height - 20,
+                    action: Action::ScrollRectangle(rectangle, delta),
+                });
+            }
+        } else {
+            for (i, delta) in [-1, 1].into_iter().enumerate() {
+                hits.push(Hit {
+                    x: MARGIN + i as u32 * (width - 20) / 2,
+                    y: height - 34,
+                    w: (width - 20) / 2,
+                    h: 24,
+                    action: Action::ScrollRectangle(rectangle, delta),
+                });
+            }
         }
     }
-
     hits
+}
+
+/// Clamp before stepping, including after sections are collapsed or resized.
+pub fn scroll_rectangle(
+    width: u32,
+    height: u32,
+    ui: &mut Ui,
+    sections: &[Section],
+    rectangle: Rectangle,
+    delta: i32,
+) {
+    let visible = layout(width, height, ui, sections, rectangle)
+        .iter()
+        .filter(|hit| matches!(hit.action, Action::Open(_) | Action::ToggleSection(_)))
+        .count()
+        .max(1);
+    let total: usize = sections
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.rectangle == rectangle)
+        .map(|(i, s)| {
+            1 + if ui.collapsed.contains(&i) {
+                0
+            } else {
+                s.websites.len()
+            }
+        })
+        .sum();
+    let max = total.saturating_sub(visible);
+    let offset = &mut ui.rectangle_scroll[rectangle as usize];
+    *offset = (*offset)
+        .min(max)
+        .saturating_add_signed(delta as isize)
+        .min(max);
+}
+
+fn rectangle_for(part: Part) -> Option<Rectangle> {
+    match part {
+        Part::Left => Some(Rectangle::Left),
+        Part::Right => Some(Rectangle::Right),
+        Part::Top => Some(Rectangle::Top),
+        Part::Bottom => Some(Rectangle::Bottom),
+        _ => None,
+    }
 }
 
 /// The only settings launcher occupies the entire bottom-left box.
@@ -238,18 +353,20 @@ pub fn frame_layout(
     dimensions: [u32; 4],
     margin: u32,
     ui: &Ui,
-    sites: usize,
+    sections: &[Section],
 ) -> Vec<Hit> {
     let mut hits = Vec::new();
     for rect in frame::layout(width, height, dimensions, margin) {
         match rect.part {
-            Part::Left => hits.extend(layout(rect.w, rect.h, ui, sites).into_iter().map(
-                |mut hit| {
-                    hit.x += rect.x;
-                    hit.y += rect.y;
-                    hit
-                },
-            )),
+            part if rectangle_for(part).is_some() => hits.extend(
+                layout(rect.w, rect.h, ui, sections, rectangle_for(part).unwrap())
+                    .into_iter()
+                    .map(|mut hit| {
+                        hit.x += rect.x;
+                        hit.y += rect.y;
+                        hit
+                    }),
+            ),
             Part::BottomLeft => hits.push(Hit {
                 x: rect.x,
                 y: rect.y,
@@ -274,6 +391,7 @@ pub fn hit_test(hits: &[Hit], x: f64, y: f64) -> Option<Action> {
 
 /// Everything the renderer needs beyond geometry.
 pub struct Content<'a> {
+    pub config: &'a Config,
     /// Row labels, parallel to the configured websites.
     pub labels: &'a [String],
     /// Fetched favicons, parallel to the configured websites.
@@ -290,98 +408,59 @@ pub struct Content<'a> {
     pub border_radius: u32,
     pub opacity: u32,
     pub desktop_dim: u32,
+    pub panel_animation: PanelAnimation,
+    pub fade_duration_ms: u32,
     /// Left/right widths and top/bottom heights, in that order.
     pub dimensions: [u32; 4],
 }
 
-/// Draw the panel into an ARGB8888 (premultiplied) canvas.
-pub fn draw(canvas: &mut [u8], width: u32, height: u32, ui: &Ui, content: &Content) {
+/// Render one rectangle using the same layout as pointer and keyboard input.
+pub fn draw_rectangle(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    ui: &Ui,
+    content: &Content,
+    rectangle: Rectangle,
+) {
     let stride = width as usize * 4;
-
     fill(canvas, stride, 0, 0, width, height, content.palette.bg);
-
-    // Accent strip along the screen edge.
-    let strip = 3.min(width);
-    fill(canvas, stride, 0, 0, strip, height, content.palette.accent);
-
-    let hits = layout(width, height, ui, content.labels.len());
-
-    // Pass 1: hover backgrounds, so all row content lands on top of them
-    // (steppers span two half-hits; either half highlights the whole row).
-    for hit in &hits {
-        if ui.hover != Some(hit.action) && ui.selected.map(Action::Open) != Some(hit.action) {
-            continue;
+    for hit in layout(width, height, ui, &content.config.sections, rectangle) {
+        let selected =
+            ui.hover == Some(hit.action) || ui.selected.map(Action::Open) == Some(hit.action);
+        if selected {
+            rounded_fill(
+                canvas,
+                stride,
+                hit.x,
+                hit.y,
+                hit.w,
+                hit.h,
+                6,
+                content.palette.hover,
+            );
         }
         match hit.action {
-            Action::Toggle | Action::ToggleSettings => {
-                fill(
-                    canvas,
-                    stride,
-                    hit.x,
-                    hit.y,
-                    hit.w,
-                    hit.h,
-                    content.palette.header,
-                );
-            }
-            Action::Open(_) => {
-                fill(
-                    canvas,
-                    stride,
-                    hit.x,
-                    hit.y,
-                    hit.w,
-                    hit.h,
-                    content.palette.hover,
-                );
-            }
-            Action::SetTheme(_) | Action::BumpStyle(_, _) | Action::RecordShortcut => {}
-            Action::BumpWidth(_) | Action::BumpHeight(_) => {
-                let (x, w) = hit.stepper_span();
-                fill(canvas, stride, x, hit.y, w, hit.h, content.palette.hover);
-            }
-        }
-    }
-
-    // Pass 2: content.
-    for hit in &hits {
-        match hit.action {
-            Action::Toggle => {
-                draw_header(canvas, width, stride, hit, content, "Websites", ui.open);
-            }
-            Action::ToggleSettings => {
-                draw_button(
-                    canvas,
-                    width,
-                    stride,
-                    hit,
-                    content,
-                    "Settings",
-                    ui.settings_open || ui.hover == Some(Action::ToggleSettings),
-                );
-            }
-            Action::Open(n) => draw_row(canvas, width, stride, hit, n, content),
-            Action::SetTheme(_) | Action::BumpStyle(_, _) | Action::RecordShortcut => {}
-            Action::BumpWidth(delta) => draw_stepper(
+            Action::ToggleSection(index) => draw_header(
                 canvas,
                 width,
                 stride,
-                hit,
-                delta,
-                &format!("W {}", content.browser_width),
-                &format!("Width {}", content.browser_width),
+                &hit,
                 content,
+                &content.config.sections[index].title,
+                !ui.collapsed.contains(&index),
             ),
-            Action::BumpHeight(delta) => draw_stepper(
+            Action::Open(index) => draw_row(canvas, width, stride, &hit, index, content),
+            Action::ScrollRectangle(_, delta) => draw_button(
                 canvas,
                 width,
                 stride,
-                hit,
-                delta,
-                &format!("H {}", content.browser_height),
-                &format!("Height {}", content.browser_height),
+                &hit,
                 content,
+                if delta < 0 { "‹" } else { "›" },
+                selected,
             ),
+            _ => {}
         }
     }
     finish_surface(
@@ -407,8 +486,8 @@ pub fn draw_frame(canvas: &mut [u8], width: u32, height: u32, ui: &Ui, content: 
     canvas.fill(0);
     for rect in frame::layout(width, height, content.dimensions, content.margin) {
         let mut card = vec![0; (rect.w * rect.h * 4) as usize];
-        if rect.part == Part::Left {
-            draw(&mut card, rect.w, rect.h, ui, content);
+        if let Some(rectangle) = rectangle_for(rect.part) {
+            draw_rectangle(&mut card, rect.w, rect.h, ui, content, rectangle);
         } else {
             let settings = rect.part == Part::BottomLeft;
             let selected =
@@ -471,7 +550,7 @@ pub fn draw_frame(canvas: &mut [u8], width: u32, height: u32, ui: &Ui, content: 
 }
 
 /// Separate settings surface: close button, appearance choices, and size controls.
-pub fn settings_layout(width: u32) -> Vec<Hit> {
+pub fn settings_layout(width: u32, ui: &Ui, config: &Config) -> Vec<Hit> {
     let inset = 20;
     let w = width.saturating_sub(inset * 2);
     let mut hits = vec![Hit {
@@ -481,6 +560,24 @@ pub fn settings_layout(width: u32) -> Vec<Hit> {
         h: 32,
         action: Action::ToggleSettings,
     }];
+    hits.push(Hit {
+        x: 146,
+        y: 16,
+        w: 118,
+        h: 32,
+        action: Action::SettingsContents(false),
+    });
+    hits.push(Hit {
+        x: 270,
+        y: 16,
+        w: 118,
+        h: 32,
+        action: Action::SettingsContents(true),
+    });
+    if ui.contents_tab {
+        hits.extend(contents_layout(ui, config));
+        return hits;
+    }
     for (i, theme) in [Theme::Light, Theme::Dark, Theme::System]
         .into_iter()
         .enumerate()
@@ -544,8 +641,13 @@ pub fn settings_layout(width: u32) -> Vec<Hit> {
             Action::BumpStyle(StyleSetting::DesktopDim, -5),
             Action::BumpStyle(StyleSetting::DesktopDim, 5),
         ),
-        (466, Action::BumpWidth(-BUMP), Action::BumpWidth(BUMP)),
-        (506, Action::BumpHeight(-BUMP), Action::BumpHeight(BUMP)),
+        (
+            506,
+            Action::BumpFadeDuration(-25),
+            Action::BumpFadeDuration(25),
+        ),
+        (586, Action::BumpWidth(-BUMP), Action::BumpWidth(BUMP)),
+        (626, Action::BumpHeight(-BUMP), Action::BumpHeight(BUMP)),
     ] {
         hits.push(Hit {
             x: inset,
@@ -562,14 +664,308 @@ pub fn settings_layout(width: u32) -> Vec<Hit> {
             action: b,
         });
     }
+    for (i, mode) in [
+        PanelAnimation::DesktopDefault,
+        PanelAnimation::FadeIn,
+        PanelAnimation::Instant,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let x = inset + w * i as u32 / 3;
+        hits.push(Hit {
+            x,
+            y: 466,
+            w: inset + w * (i as u32 + 1) / 3 - x - 4,
+            h: 34,
+            action: Action::SetPanelAnimation(mode),
+        });
+    }
     hits.push(Hit {
         x: inset,
-        y: 584,
+        y: 704,
         w,
         h: 34,
         action: Action::RecordShortcut,
     });
     hits
+}
+
+/// Only the four rectangles are selectable; corner content has no editor.
+fn contents_layout(ui: &Ui, config: &Config) -> Vec<Hit> {
+    let mut hits = Vec::new();
+    let mut add = |x, y, w, action| {
+        hits.push(Hit {
+            x,
+            y,
+            w,
+            h: 32,
+            action,
+        })
+    };
+    for (i, rectangle) in Rectangle::ALL.into_iter().enumerate() {
+        add(
+            20 + i as u32 * 106,
+            92,
+            100,
+            Action::SelectRectangle(rectangle),
+        );
+    }
+    add(250, 134, 90, Action::AddSection);
+    let editor = &ui.editor;
+    let sections = editor.sections(config);
+    for (row, &index) in sections
+        .iter()
+        .skip(editor.section_page * PAGE_SIZE)
+        .take(PAGE_SIZE)
+        .enumerate()
+    {
+        add(20, 174 + row as u32 * 36, 420, Action::SelectSection(index));
+    }
+    if editor.section_page > 0 {
+        add(20, 282, 100, Action::SectionPage(-1));
+    }
+    if (editor.section_page + 1) * PAGE_SIZE < sections.len() {
+        add(340, 282, 100, Action::SectionPage(1));
+    }
+    if let Some(section) = editor.section.and_then(|i| config.sections.get(i)) {
+        add(346, 134, 94, Action::RemoveSection);
+        add(20, 332, 310, Action::FocusField(Field::SectionName));
+        add(342, 332, 98, Action::SaveSection);
+        add(250, 380, 90, Action::AddWebsite);
+        if editor.website.is_some() {
+            add(346, 380, 94, Action::RemoveWebsite);
+        }
+        for (row, index) in (0..section.websites.len())
+            .skip(editor.website_page * PAGE_SIZE)
+            .take(PAGE_SIZE)
+            .enumerate()
+        {
+            add(20, 420 + row as u32 * 34, 420, Action::SelectWebsite(index));
+        }
+        if editor.website_page > 0 {
+            add(20, 526, 100, Action::WebsitePage(-1));
+        }
+        if (editor.website_page + 1) * PAGE_SIZE < section.websites.len() {
+            add(340, 526, 100, Action::WebsitePage(1));
+        }
+        if editor.website.is_some() || editor.adding_website {
+            add(20, 588, 420, Action::FocusField(Field::WebsiteTitle));
+            add(20, 648, 420, Action::FocusField(Field::WebsiteUrl));
+            add(280, 698, 160, Action::SaveWebsite);
+        }
+    }
+    hits
+}
+
+fn draw_contents(canvas: &mut [u8], width: u32, height: u32, ui: &Ui, content: &Content) {
+    let stride = width as usize * 4;
+    let editor = &ui.editor;
+    let section = editor.section.and_then(|i| content.config.sections.get(i));
+    let sections = editor.sections(content.config);
+    if let Some(font) = content.font {
+        let section_page = format!(
+            "Page {} of {}",
+            editor.section_page + 1,
+            sections.len().div_ceil(PAGE_SIZE).max(1)
+        );
+        let website_page = format!(
+            "Page {} of {}",
+            editor.website_page + 1,
+            section
+                .map_or(0, |s| s.websites.len())
+                .div_ceil(PAGE_SIZE)
+                .max(1)
+        );
+        let mut labels = vec![
+            ("Settings", 24, 38),
+            ("Choose a rectangle. Corner boxes stay fixed.", 24, 76),
+            ("Sections", 24, 156),
+            (section_page.as_str(), 164, 302),
+        ];
+        if section.is_some() {
+            labels.extend([
+                ("Section name", 24, 326),
+                ("Websites", 24, 402),
+                (website_page.as_str(), 164, 546),
+            ]);
+            if editor.website.is_some() || editor.adding_website {
+                labels.extend([("Title (optional)", 24, 580), ("URL", 24, 640)]);
+            } else {
+                labels.push(("Add a website to this section.", 24, 580));
+            }
+        } else {
+            labels.push(("Add a section to this rectangle.", 24, 342));
+        }
+        for (label, x, y) in labels {
+            font.draw(
+                canvas,
+                width,
+                stride,
+                x,
+                y,
+                if label == "Settings" { 18.0 } else { FONT_PX },
+                label,
+                content.palette.text,
+            );
+        }
+        let message = font.ellipsize(&editor.message, FONT_PX, 408.0);
+        font.draw(
+            canvas,
+            width,
+            stride,
+            24,
+            756,
+            FONT_PX,
+            &message,
+            content.palette.text,
+        );
+    }
+    for hit in settings_layout(width, ui, content.config) {
+        let hover = ui.hover == Some(hit.action);
+        let (label, selected) = match hit.action {
+            Action::ToggleSettings => ("×".into(), hover),
+            Action::SettingsContents(contents) => (
+                if contents { "Contents" } else { "Appearance" }.into(),
+                contents,
+            ),
+            Action::SelectRectangle(rectangle) => {
+                (rectangle.label().into(), rectangle == editor.rectangle)
+            }
+            Action::SelectSection(index) => (
+                content.config.sections[index].title.clone(),
+                editor.section == Some(index),
+            ),
+            Action::SelectWebsite(index) => (
+                section.unwrap().websites[index].label(),
+                editor.website == Some(index),
+            ),
+            Action::AddSection | Action::AddWebsite => ("+ Add".into(), hover),
+            Action::RemoveSection | Action::RemoveWebsite => ("Remove".into(), hover),
+            Action::SaveSection => ("Rename".into(), hover),
+            Action::SaveWebsite => (
+                if editor.adding_website {
+                    "Add website"
+                } else {
+                    "Save website"
+                }
+                .into(),
+                hover,
+            ),
+            Action::SectionPage(delta) | Action::WebsitePage(delta) => (
+                if delta < 0 {
+                    "‹ Previous"
+                } else {
+                    "Next ›"
+                }
+                .into(),
+                hover,
+            ),
+            Action::FocusField(field) => {
+                draw_input(canvas, width, stride, &hit, content, ui, field);
+                continue;
+            }
+            _ => continue,
+        };
+        draw_button(canvas, width, stride, &hit, content, &label, selected);
+    }
+    finish_surface(
+        canvas,
+        width,
+        height,
+        content.border_radius,
+        content.opacity,
+    );
+}
+
+fn draw_input(
+    canvas: &mut [u8],
+    width: u32,
+    stride: usize,
+    hit: &Hit,
+    content: &Content,
+    ui: &Ui,
+    field: Field,
+) {
+    let focused = ui.editor.focus == Some(field);
+    rounded_fill(
+        canvas,
+        stride,
+        hit.x,
+        hit.y,
+        hit.w,
+        hit.h,
+        6,
+        if focused {
+            content.palette.accent
+        } else {
+            content.palette.divider
+        },
+    );
+    rounded_fill(
+        canvas,
+        stride,
+        hit.x + 1,
+        hit.y + 1,
+        hit.w - 2,
+        hit.h - 2,
+        5,
+        content.palette.bg,
+    );
+    let Some(font) = content.font else {
+        return;
+    };
+    let input = ui.editor.input(field);
+    let mut start = 0;
+    if focused {
+        while font.measure(&input.text[start..input.cursor], FONT_PX)
+            > hit.w.saturating_sub(24) as f32
+        {
+            start += input.text[start..].chars().next().unwrap().len_utf8();
+        }
+    }
+    if focused && input.selected_all {
+        fill(
+            canvas,
+            stride,
+            hit.x + 4,
+            hit.y + 4,
+            hit.w - 8,
+            hit.h - 8,
+            content.palette.hover,
+        );
+    }
+    let text = font.ellipsize(
+        &input.text[start..],
+        FONT_PX,
+        hit.w.saturating_sub(16) as f32,
+    );
+    font.draw(
+        canvas,
+        width,
+        stride,
+        (hit.x + 8) as i32,
+        (hit.y + 21) as i32,
+        FONT_PX,
+        &text,
+        content.palette.text,
+    );
+    if focused {
+        let x = hit.x
+            + 8
+            + font
+                .measure(&input.text[start..input.cursor], FONT_PX)
+                .round() as u32;
+        fill(
+            canvas,
+            stride,
+            x,
+            hit.y + 6,
+            1,
+            hit.h - 12,
+            content.palette.accent,
+        );
+    }
 }
 
 fn draw_button(
@@ -611,8 +1007,8 @@ fn draw_button(
 }
 
 /// Scale the complete settings card to fit smaller outputs, including its hits.
-pub fn settings_hits(width: u32, height: u32) -> Vec<Hit> {
-    settings_layout(SETTINGS_WIDTH)
+pub fn settings_hits(width: u32, height: u32, ui: &Ui, config: &Config) -> Vec<Hit> {
+    settings_layout(SETTINGS_WIDTH, ui, config)
         .into_iter()
         .map(|hit| {
             let x = (hit.x * width).div_ceil(SETTINGS_WIDTH);
@@ -659,14 +1055,19 @@ fn draw_settings_native(canvas: &mut [u8], width: u32, height: u32, ui: &Ui, con
         1,
         content.palette.divider,
     );
+    if ui.contents_tab {
+        draw_contents(canvas, width, height, ui, content);
+        return;
+    }
     if let Some(font) = content.font {
         for (label, y) in [
             ("Settings", 38),
             ("Appearance", 76),
             ("Edge panel sizes (px)", 146),
             ("Spacing and style", 254),
-            ("Browser window size", 450),
-            ("Open panels shortcut", 570),
+            ("Panel opening (applies next open)", 450),
+            ("Browser window size", 570),
+            ("Open panels shortcut", 690),
         ] {
             font.draw(
                 canvas,
@@ -680,11 +1081,19 @@ fn draw_settings_native(canvas: &mut [u8], width: u32, height: u32, ui: &Ui, con
             );
         }
     }
-    let hits = settings_layout(width);
+    let hits = settings_layout(width, ui, content.config);
     // Each pair shares one rounded card; paint it before either half's text.
-    for pair in hits[4..hits.len() - 1].chunks_exact(2) {
+    for pair in hits.windows(2) {
         let left = &pair[0];
         let right = &pair[1];
+        match left.action {
+            Action::BumpWidth(delta)
+            | Action::BumpHeight(delta)
+            | Action::BumpStyle(_, delta)
+            | Action::BumpFadeDuration(delta)
+                if delta < 0 => {}
+            _ => continue,
+        }
         let hover = ui.hover == Some(left.action) || ui.hover == Some(right.action);
         rounded_fill(
             canvas,
@@ -705,6 +1114,15 @@ fn draw_settings_native(canvas: &mut [u8], width: u32, height: u32, ui: &Ui, con
         let hover = ui.hover == Some(hit.action);
         match hit.action {
             Action::ToggleSettings => draw_button(canvas, width, stride, &hit, content, "×", hover),
+            Action::SettingsContents(contents) => draw_button(
+                canvas,
+                width,
+                stride,
+                &hit,
+                content,
+                if contents { "Contents" } else { "Appearance" },
+                contents == ui.contents_tab,
+            ),
             Action::RecordShortcut => {
                 let label = if ui.recording_shortcut {
                     "Press keys… Esc cancels".to_string()
@@ -749,8 +1167,27 @@ fn draw_settings_native(canvas: &mut [u8], width: u32, height: u32, ui: &Ui, con
                     );
                 }
             }
-            Action::BumpWidth(delta) | Action::BumpHeight(delta) | Action::BumpStyle(_, delta) => {
+            Action::SetPanelAnimation(mode) => draw_button(
+                canvas,
+                width,
+                stride,
+                &hit,
+                content,
+                match mode {
+                    PanelAnimation::DesktopDefault => "Desktop Default",
+                    PanelAnimation::FadeIn => "Fade In",
+                    PanelAnimation::Instant => "Instant",
+                },
+                mode == content.panel_animation,
+            ),
+            Action::BumpWidth(delta)
+            | Action::BumpHeight(delta)
+            | Action::BumpStyle(_, delta)
+            | Action::BumpFadeDuration(delta) => {
                 let label = match hit.action {
+                    Action::BumpFadeDuration(_) => {
+                        format!("Fade duration {} ms", content.fade_duration_ms)
+                    }
                     Action::BumpWidth(_) => format!("Width {}", content.browser_width),
                     Action::BumpStyle(StyleSetting::LeftWidth, _) => {
                         format!("Left width {}", content.dimensions[0])
@@ -794,7 +1231,7 @@ fn draw_settings_native(canvas: &mut [u8], width: u32, height: u32, ui: &Ui, con
             width,
             stride,
             24,
-            644,
+            764,
             FONT_PX,
             &message,
             content.palette.text,
@@ -879,14 +1316,14 @@ fn draw_header(
     let Some(font) = content.font else {
         return;
     };
-    let baseline = hit.y as f32 + (HEADER_H as f32 + font.ascent(FONT_PX)) / 2.0;
-    if width < 140 {
+    let baseline = hit.y as f32 + (hit.h as f32 + font.ascent(FONT_PX)) / 2.0;
+    if hit.w < 100 {
         draw_globe(
             canvas,
             width,
             stride,
             hit.x + 4,
-            hit.y + (HEADER_H - favicon::ICON) / 2,
+            hit.y + hit.h.saturating_sub(favicon::ICON) / 2,
             content.palette.icon,
         );
     } else {
@@ -897,13 +1334,13 @@ fn draw_header(
             (hit.x + PAD) as i32,
             baseline.round() as i32,
             FONT_PX,
-            title,
+            &font.ellipsize(title, FONT_PX, hit.w.saturating_sub(32) as f32),
             content.palette.text,
         );
     }
     // Drop-down caret on the right: ▲ expanded, ▼ collapsed.
     let cx = (hit.x + hit.w - PAD - 4) as i32;
-    let cy = hit.y as i32 + (HEADER_H / 2) as i32;
+    let cy = hit.y as i32 + (hit.h / 2) as i32;
     draw_caret(
         canvas,
         width,
@@ -915,7 +1352,7 @@ fn draw_header(
     );
     // Divider between the header and its content.
     if expanded {
-        let y = hit.y + hit.h + 3;
+        let y = hit.y + hit.h - 1;
         fill(
             canvas,
             stride,
@@ -930,13 +1367,13 @@ fn draw_header(
 
 fn draw_row(canvas: &mut [u8], width: u32, stride: usize, hit: &Hit, n: usize, content: &Content) {
     // Favicon (or a placeholder globe) on the left.
-    let compact = width < 140;
+    let compact = hit.w < 100;
     let box_x = if compact {
         hit.x + (hit.w - favicon::ICON) / 2
     } else {
         hit.x + PAD
     };
-    let box_y = hit.y + (ROW_H.saturating_sub(favicon::ICON)) / 2;
+    let box_y = hit.y + (hit.h.saturating_sub(favicon::ICON)) / 2;
     match content.icons.get(n).and_then(|icon| icon.as_ref()) {
         Some(icon) => draw_icon(canvas, width, stride, box_x, box_y, icon),
         None => draw_globe(canvas, width, stride, box_x, box_y, content.palette.icon),
@@ -955,7 +1392,7 @@ fn draw_row(canvas: &mut [u8], width: u32, stride: usize, hit: &Hit, n: usize, c
     let text_x = box_x + favicon::ICON + 10;
     let text_max = (hit.x + hit.w).saturating_sub(text_x + 6) as f32;
     let text = font.ellipsize(label, FONT_PX, text_max);
-    let top = hit.y as f32 + (ROW_H as f32 - font.line_height(FONT_PX)) / 2.0;
+    let top = hit.y as f32 + (hit.h as f32 - font.line_height(FONT_PX)) / 2.0;
     let baseline = top + font.ascent(FONT_PX);
     font.draw(
         canvas,
@@ -1181,17 +1618,120 @@ mod tests {
     use crate::favicon::Icon;
     use crate::text::TextRenderer;
 
+    fn test_sections(sites: usize) -> Vec<Section> {
+        vec![Section {
+            rectangle: Rectangle::Left,
+            title: "Websites".into(),
+            websites: (0..sites)
+                .map(|_| crate::config::Website::new("https://example.com/"))
+                .collect(),
+        }]
+    }
+
+    #[test]
+    fn all_rectangles_reach_overflow_content_without_customizing_corners() {
+        let mut config = Config {
+            sections: vec![],
+            ..Config::default()
+        };
+        for rectangle in Rectangle::ALL {
+            let mut section = test_sections(12).remove(0);
+            section.rectangle = rectangle;
+            config.sections.push(section);
+        }
+        let mut ui = Ui::default();
+        let rects = frame::layout(1200, 800, [64; 4], 12);
+        for rect in &rects {
+            let Some(rectangle) = rectangle_for(rect.part) else {
+                continue;
+            };
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..30 {
+                let hits = layout(rect.w, rect.h, &ui, &config.sections, rectangle);
+                for hit in &hits {
+                    assert!(hit.x + hit.w <= rect.w && hit.y + hit.h <= rect.h);
+                    assert_eq!(
+                        hit_test(
+                            &hits,
+                            (hit.x + hit.w / 2) as f64,
+                            (hit.y + hit.h / 2) as f64
+                        ),
+                        Some(hit.action)
+                    );
+                    if let Action::Open(index) = hit.action {
+                        seen.insert(index);
+                    }
+                }
+                scroll_rectangle(rect.w, rect.h, &mut ui, &config.sections, rectangle, 1);
+            }
+            assert_eq!(seen.len(), 12, "unreachable sites in {rectangle:?}");
+            let last = ui.rectangle_scroll[rectangle as usize];
+            scroll_rectangle(rect.w, rect.h, &mut ui, &config.sections, rectangle, -1);
+            assert_eq!(
+                ui.rectangle_scroll[rectangle as usize],
+                last.saturating_sub(1)
+            );
+        }
+        let hits = frame_layout(1200, 800, [64; 4], 12, &ui, &config.sections);
+        for rect in rects.iter().filter(|r| rectangle_for(r.part).is_none()) {
+            let action = hit_test(
+                &hits,
+                (rect.x + rect.w / 2) as f64,
+                (rect.y + rect.h / 2) as f64,
+            );
+            assert_eq!(
+                action,
+                (rect.part == Part::BottomLeft).then_some(Action::ToggleSettings)
+            );
+        }
+    }
+
+    #[test]
+    fn contents_controls_are_reachable_on_scaled_surfaces_and_later_pages() {
+        let mut config = Config::default();
+        let mut ui = Ui {
+            contents_tab: true,
+            ..Ui::default()
+        };
+        ui.editor.select_rectangle(Rectangle::Left, &config);
+        for _ in 0..7 {
+            ui.editor.apply(Action::AddSection, &mut config);
+        }
+        for _ in 0..8 {
+            ui.editor.apply(Action::AddWebsite, &mut config);
+            ui.editor.url.text = "https://example.org".into();
+            ui.editor.apply(Action::SaveWebsite, &mut config);
+        }
+        for (width, height) in [(SETTINGS_WIDTH, SETTINGS_HEIGHT), (320, 400)] {
+            let hits = settings_hits(width, height, &ui, &config);
+            assert!(hits.iter().any(|h| h.action == Action::SectionPage(-1)));
+            assert!(hits.iter().any(|h| h.action == Action::WebsitePage(-1)));
+            assert!(hits.iter().any(|h| h.action == Action::SaveWebsite));
+            for hit in &hits {
+                assert!(hit.x + hit.w <= width && hit.y + hit.h <= height);
+                assert_eq!(
+                    hit_test(
+                        &hits,
+                        (hit.x + hit.w / 2) as f64,
+                        (hit.y + hit.h / 2) as f64
+                    ),
+                    Some(hit.action)
+                );
+            }
+        }
+    }
+
     #[test]
     fn keyboard_selection_starts_at_first_and_stops_at_ends() {
         let mut ui = Ui::default();
-        ui.hover = Some(Action::Toggle);
-        ui.open = false;
+        ui.hover = Some(Action::ToggleSection(0));
+        ui.collapsed = vec![0];
         ui.select_first(3);
-        assert!(ui.open);
+        assert!(ui.collapsed.is_empty());
         assert_eq!(ui.hover, None);
         assert_eq!(ui.selected, Some(0));
 
-        let hits = layout(260, 800, &ui, 3);
+        let hits = layout(260, 800, &ui, &test_sections(3), Rectangle::Left);
         assert_eq!(ui.selected_action(&hits), Some(Action::Open(0)));
 
         ui.move_selection(&hits, false);
@@ -1204,8 +1744,8 @@ mod tests {
         assert_eq!(ui.selected, Some(2));
         assert_eq!(ui.selected_action(&hits), Some(Action::Open(2)));
 
-        ui.open = false;
-        let collapsed = layout(260, 800, &ui, 3);
+        ui.collapsed = vec![0];
+        let collapsed = layout(260, 800, &ui, &test_sections(3), Rectangle::Left);
         ui.move_selection(&collapsed, true);
         assert_eq!(ui.selected, Some(2));
         assert_eq!(ui.selected_action(&collapsed), None);
@@ -1219,7 +1759,14 @@ mod tests {
     fn settings_launch_only_from_bottom_left_and_all_controls_are_reachable() {
         let ui = Ui::default();
         for (width, height) in [(1560, 1000), (800, 600)] {
-            let hits = frame_layout(width, height, [64, 80, 48, 56], 12, &ui, 100);
+            let hits = frame_layout(
+                width,
+                height,
+                [64, 80, 48, 56],
+                12,
+                &ui,
+                &test_sections(100),
+            );
             let launcher = hits
                 .iter()
                 .find(|hit| hit.action == Action::ToggleSettings)
@@ -1232,7 +1779,7 @@ mod tests {
                     .count(),
                 1
             );
-            assert!(layout(200, 600, &ui, 100)
+            assert!(layout(200, 600, &ui, &test_sections(100), Rectangle::Left)
                 .iter()
                 .all(|h| h.action != Action::ToggleSettings));
             assert_eq!(
@@ -1245,8 +1792,22 @@ mod tests {
             );
         }
         for (width, height) in [(SETTINGS_WIDTH, SETTINGS_HEIGHT), (320, 400)] {
-            let hits = settings_hits(width, height);
-            assert_eq!(hits.len(), 25);
+            let hits = settings_hits(width, height, &ui, &Config::default());
+            assert_eq!(hits.len(), 32);
+            for mode in [
+                PanelAnimation::DesktopDefault,
+                PanelAnimation::FadeIn,
+                PanelAnimation::Instant,
+            ] {
+                assert!(hits
+                    .iter()
+                    .any(|h| h.action == Action::SetPanelAnimation(mode)));
+            }
+            for delta in [-25, 25] {
+                assert!(hits
+                    .iter()
+                    .any(|h| h.action == Action::BumpFadeDuration(delta)));
+            }
             for delta in [-5, 5] {
                 assert!(hits
                     .iter()
@@ -1278,7 +1839,7 @@ mod tests {
                 assert!(hits.iter().any(|h| h.action == Action::SetTheme(theme)));
             }
         }
-        assert!(layout(4, 4, &ui, 100).is_empty());
+        assert!(layout(4, 4, &ui, &test_sections(100), Rectangle::Left).is_empty());
     }
 
     #[test]
@@ -1313,6 +1874,10 @@ mod tests {
     fn dimming_is_isolated_from_the_transparent_browser_overlay() {
         let ui = Ui::default();
         let mut content = Content {
+            config: &Config {
+                sections: vec![],
+                ..Config::default()
+            },
             labels: &[],
             icons: &[],
             font: None,
@@ -1325,6 +1890,8 @@ mod tests {
             border_radius: 16,
             opacity: 100,
             desktop_dim: 50,
+            panel_animation: PanelAnimation::DesktopDefault,
+            fade_duration_ms: 150,
             dimensions: [48, 48, 40, 40],
         };
         let (w, h) = (320, 240);
@@ -1344,7 +1911,7 @@ mod tests {
                 assert_eq!(pixel(&canvas, x, y), [0; 4]);
             }
             assert_eq!(pixel(&canvas, 160, 32), content.palette.bg.to_le_bytes());
-            let hits = frame_layout(w, h, content.dimensions, content.margin, &ui, 0);
+            let hits = frame_layout(w, h, content.dimensions, content.margin, &ui, &[]);
             assert_eq!(hit_test(&hits, 160.0, 120.0), None);
         }
         content.opacity = 50;
@@ -1380,12 +1947,16 @@ mod tests {
         ];
 
         let ui = Ui {
-            open: true,
+            collapsed: Vec::new(),
+            rectangle_scroll: [0; 4],
+            contents_tab: false,
+            editor: Editor::default(),
             settings_open: true,
             hover: Some(Action::Open(0)),
             ..Ui::default()
         };
         let content = Content {
+            config: &Config::default(),
             labels: &labels,
             icons: &icons,
             font: Some(&font),
@@ -1398,12 +1969,14 @@ mod tests {
             border_radius: 16,
             opacity: 100,
             desktop_dim: 20,
+            panel_animation: PanelAnimation::DesktopDefault,
+            fade_duration_ms: 150,
             dimensions: [64; 4],
         };
 
         let (width, height) = (260, 240);
         let mut canvas = vec![0u8; (width * height * 4) as usize];
-        draw(&mut canvas, width, height, &ui, &content);
+        draw_rectangle(&mut canvas, width, height, &ui, &content, Rectangle::Left);
 
         // The canvas is premultiplied BGRA; PNG wants straight RGBA.
         let mut rgba = Vec::with_capacity(canvas.len());
@@ -1462,6 +2035,33 @@ mod tests {
             &rgba,
             w,
             h,
+            image::ColorType::Rgba8,
+        )
+        .unwrap();
+
+        let mut editor_ui = ui.clone();
+        editor_ui.contents_tab = true;
+        editor_ui
+            .editor
+            .select_rectangle(Rectangle::Left, content.config);
+        editor_ui.editor.focus = Some(Field::WebsiteUrl);
+        let mut editor_canvas = vec![0; (SETTINGS_WIDTH * SETTINGS_HEIGHT * 4) as usize];
+        draw_settings(
+            &mut editor_canvas,
+            SETTINGS_WIDTH,
+            SETTINGS_HEIGHT,
+            &editor_ui,
+            &content,
+        );
+        let rgba: Vec<u8> = editor_canvas
+            .chunks_exact(4)
+            .flat_map(|p| [p[2], p[1], p[0], p[3]])
+            .collect();
+        image::save_buffer(
+            "/tmp/settings_contents.png",
+            &rgba,
+            SETTINGS_WIDTH,
+            SETTINGS_HEIGHT,
             image::ColorType::Rgba8,
         )
         .unwrap();
