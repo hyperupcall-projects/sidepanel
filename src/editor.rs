@@ -1,16 +1,18 @@
 //! Drafts and text input for the rectangle contents editor.
 use crate::config::{Config, Rectangle};
+use serde::{Deserialize, Serialize};
 
 pub const PAGE_SIZE: usize = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Field {
     SectionName,
     WebsiteTitle,
     WebsiteUrl,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct TextInput {
     pub text: String,
     /// UTF-8 byte boundary.
@@ -64,7 +66,8 @@ impl TextInput {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct Editor {
     pub rectangle: Rectangle,
     /// Global section index; website index is local to that section.

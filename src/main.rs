@@ -15,8 +15,10 @@ mod config;
 mod editor;
 mod favicon;
 mod frame;
+mod geometry;
 mod hotkey;
 mod panel;
+mod persistence;
 mod text;
 mod theme;
 
@@ -87,7 +89,27 @@ fn main() -> Result<()> {
 
     // Pre-warm the browser helper process (hidden window) and load the
     // panel font up front.
-    let browser = browser::Browser::start(config.browser_width, config.browser_height);
+    let store = persistence::Store::new();
+    let identity = persistence::Identity::current();
+    let loaded = store.load(config.persist_changes_to_panels, &identity);
+    let cache_active = loaded.is_some();
+    let mut session = loaded.unwrap_or_else(|| {
+        let mut fresh = persistence::Session::default();
+        fresh.ui.select_first(config.websites().count());
+        fresh.browser.width = config.browser_width;
+        fresh.browser.height = config.browser_height;
+        fresh
+    });
+    session.sanitize(&config);
+    session.hidden_since = Some(session.hidden_since.unwrap_or(session.saved_at));
+    let ui = session.ui.clone();
+    let (browser_tx, browser_channel) = calloop::channel::channel::<browser::Event>();
+    let browser = browser::Browser::start(
+        config.browser_width,
+        config.browser_height,
+        session.browser.clone(),
+        browser_tx,
+    );
     let font = text::TextRenderer::load();
     let labels: Vec<String> = config.websites().map(|site| site.label()).collect();
     let favicon_targets: Vec<String> = config.websites().map(|site| site.url.clone()).collect();
@@ -135,7 +157,12 @@ fn main() -> Result<()> {
         keyboard: None,
         modifiers: Modifiers::default(),
         shortcut_requests: None,
-        ui: panel::Ui::default(),
+        ui,
+        store,
+        session,
+        identity,
+        cache_active,
+        saved_ui: Vec::new(),
         labels,
         icons,
         icon_urls: favicon_targets.clone(),
@@ -154,6 +181,37 @@ fn main() -> Result<()> {
     WaylandSource::new(conn, event_queue)
         .insert(handle.clone())
         .context("failed to insert the Wayland event source")?;
+
+    handle
+        .insert_source(browser_channel, |event, _, app| {
+            if let calloop::channel::Event::Msg(event) = event {
+                if app.browser.on_event(&event, app.panel.is_some()) {
+                    app.save_session(true);
+                    app.draw();
+                }
+            }
+        })
+        .map_err(|err| anyhow!("failed to insert browser event source: {err:?}"))?;
+    let (identity_tx, identity_channel) = calloop::channel::channel();
+    handle
+        .insert_source(identity_channel, |event, _, app| {
+            if let calloop::channel::Event::Msg(identity) = event {
+                app.identity = identity;
+                app.expire_session();
+            }
+        })
+        .map_err(|err| anyhow!("failed to insert login event source: {err:?}"))?;
+    persistence::watch_identity(identity_tx);
+    handle
+        .insert_source(
+            calloop::timer::Timer::from_duration(std::time::Duration::from_secs(1)),
+            |_, _, app| {
+                app.expire_session();
+                app.save_session(false);
+                calloop::timer::TimeoutAction::ToDuration(std::time::Duration::from_secs(1))
+            },
+        )
+        .map_err(|err| anyhow!("failed to insert persistence timer: {err:?}"))?;
 
     // Favicon results, fetched in the background.
     let (fav_tx, fav_channel) = calloop::channel::channel::<favicon::Event>();
@@ -304,14 +362,15 @@ struct App {
     font: Option<text::TextRenderer>,
     /// Pre-warmed browser helper process.
     browser: browser::Browser,
+    store: persistence::Store,
+    session: persistence::Session,
+    identity: persistence::Identity,
+    cache_active: bool,
+    saved_ui: Vec<u8>,
 }
 
 impl App {
     fn toggle(&mut self) {
-        // Meta+F also dismisses any browser window this panel opened — on
-        // both directions of the toggle (summoning the panel starts clean,
-        // hiding it takes the browser with it).
-        self.browser.dismiss();
         if self.panel.is_some() {
             self.hide();
         } else {
@@ -322,6 +381,10 @@ impl App {
     /// Create and map the layer surface. The compositor replies with a
     /// `configure` event, at which point we draw the first frame.
     fn show(&mut self) {
+        self.expire_session();
+        self.cache_active = true;
+        self.session.hidden_since = None;
+        self.session.identity = self.identity.clone();
         let qh = self.qh.clone();
         let surface = self.compositor_state.create_surface(&qh);
         let layer = self.layer_shell.create_layer_surface(
@@ -357,15 +420,18 @@ impl App {
         if self.exporter.is_some() {
             self.browser.wait_for_parent();
         }
-        self.ui.select_first(self.labels.len());
+        self.browser.resume();
+        self.save_session(true);
         log::debug!("panel shown");
     }
 
     /// Dropping the `LayerSurface` destroys the underlying `wl_surface`, which
     /// unmaps it.
     fn hide(&mut self) {
+        if self.panel.is_none() {
+            return;
+        }
         self.editor_revision = self.editor_revision.wrapping_add(1);
-        self.ui.editor.focus = None;
         self.browser.dismiss();
         self.browser.clear_parent();
         if let Some(exported) = self.backdrop_export.take() {
@@ -374,11 +440,12 @@ impl App {
         self.backdrop = None;
         self.ui.recording_shortcut = false;
         self.settings = None;
-        self.ui.settings_open = false;
         self.ui.hover = None;
         if self.panel.take().is_some() {
             log::debug!("panel hidden");
         }
+        self.session.hidden_since = Some(persistence::now());
+        self.save_session(true);
     }
 
     /// Map on the frame's actual output. Exporting this top-level equivalent
@@ -738,6 +805,14 @@ impl App {
                 self.save_config();
                 true
             }
+            Action::BumpPersistence(delta) => {
+                self.config.persist_changes_to_panels =
+                    self.config.persist_changes_to_panels.step(delta);
+                self.session.identity = self.identity.clone();
+                self.save_config();
+                self.save_session(true);
+                true
+            }
             Action::BumpFadeDuration(delta) => {
                 let next = (i64::from(self.config.fade_duration_ms) + i64::from(delta))
                     .clamp(0, i64::from(config::MAX_FADE_DURATION_MS))
@@ -933,6 +1008,61 @@ impl App {
         self.draw();
     }
 
+    fn save_session(&mut self, force: bool) {
+        if !self.cache_active {
+            return;
+        }
+        let Ok(ui) = serde_json::to_vec(&self.ui) else {
+            return;
+        };
+        if !force && ui == self.saved_ui {
+            return;
+        }
+        self.session.ui = self.ui.clone();
+        self.session.browser = self.browser.snapshot();
+        self.session.saved_at = persistence::now();
+        // Identity is anchored to this login/boot, never screen-lock status.
+        self.session.identity = self.identity.clone();
+        match self.store.save(&self.session) {
+            Ok(()) => self.saved_ui = ui,
+            Err(err) => log::warn!("could not save panel session: {err:#}"),
+        }
+    }
+
+    fn expire_session(&mut self) {
+        if !self.cache_active {
+            return;
+        }
+        // Duration limits apply to hidden panels. Event boundaries still
+        // invalidate disk state if the daemon outlives its graphical session.
+        if self.panel.is_some()
+            && matches!(
+                self.config.persist_changes_to_panels,
+                config::Persistence::Minutes(_)
+            )
+        {
+            return;
+        }
+        if !self.session.expired(
+            self.config.persist_changes_to_panels,
+            persistence::now(),
+            &self.identity,
+        ) {
+            return;
+        }
+        self.store.clear();
+        self.cache_active = false;
+        self.saved_ui.clear();
+        self.browser.reset();
+        self.ui = panel::Ui::default();
+        self.ui.select_first(self.labels.len());
+        self.settings = None;
+        self.session = persistence::Session::default();
+        self.editor_revision = self.editor_revision.wrapping_add(1);
+        self.draw();
+        log::info!("remembered panel session expired");
+    }
+
     /// Persist the config (best effort — failures are logged, not fatal).
     fn save_config(&self) {
         if let Err(err) = self.config.save() {
@@ -1091,6 +1221,9 @@ impl LayerShellHandler for App {
         panel.configured = true;
         if is_frame {
             self.update_settings_geometry();
+            if self.ui.settings_open && self.settings.is_none() {
+                self.show_settings();
+            }
         }
         self.draw();
     }

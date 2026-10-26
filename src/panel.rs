@@ -52,7 +52,7 @@ impl Palette {
 }
 
 pub const SETTINGS_WIDTH: u32 = 460;
-pub const SETTINGS_HEIGHT: u32 = 784;
+pub const SETTINGS_HEIGHT: u32 = 864;
 
 const MARGIN: u32 = 10;
 const PAD: u32 = 8;
@@ -103,6 +103,7 @@ pub enum Action {
     SetTheme(Theme),
     SetPanelAnimation(PanelAnimation),
     BumpFadeDuration(i32),
+    BumpPersistence(i32),
     BumpStyle(StyleSetting, i32),
     /// Step the browser window width by `i32` pixels (±`BUMP`).
     BumpWidth(i32),
@@ -130,7 +131,11 @@ impl Hit {
     /// The full stepper row a ±half belongs to: `(x, w)`.
     fn stepper_span(&self) -> (u32, u32) {
         match self.action {
-            Action::BumpWidth(delta) | Action::BumpHeight(delta) | Action::BumpStyle(_, delta)
+            Action::BumpWidth(delta)
+            | Action::BumpHeight(delta)
+            | Action::BumpStyle(_, delta)
+            | Action::BumpPersistence(delta)
+            | Action::BumpFadeDuration(delta)
                 if delta < 0 =>
             {
                 (self.x, self.w * 2)
@@ -141,7 +146,8 @@ impl Hit {
 }
 
 /// Panel interaction state; persists while the daemon runs (across hide/show).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
 pub struct Ui {
     /// Collapsed section indices and per-rectangle overflow position.
     pub collapsed: Vec<usize>,
@@ -151,11 +157,15 @@ pub struct Ui {
     /// Is the separate settings surface open?
     pub settings_open: bool,
     /// Action under the cursor, if any (drives hover highlighting).
+    #[serde(skip)]
     pub hover: Option<Action>,
     /// Keyboard-selected website, independent of pointer hover.
     pub selected: Option<usize>,
+    #[serde(skip)]
     pub recording_shortcut: bool,
+    #[serde(skip)]
     pub shortcut_pending: bool,
+    #[serde(skip)]
     pub shortcut_message: String,
 }
 
@@ -648,6 +658,7 @@ pub fn settings_layout(width: u32, ui: &Ui, config: &Config) -> Vec<Hit> {
         ),
         (586, Action::BumpWidth(-BUMP), Action::BumpWidth(BUMP)),
         (626, Action::BumpHeight(-BUMP), Action::BumpHeight(BUMP)),
+        (704, Action::BumpPersistence(-1), Action::BumpPersistence(1)),
     ] {
         hits.push(Hit {
             x: inset,
@@ -683,7 +694,7 @@ pub fn settings_layout(width: u32, ui: &Ui, config: &Config) -> Vec<Hit> {
     }
     hits.push(Hit {
         x: inset,
-        y: 704,
+        y: 784,
         w,
         h: 34,
         action: Action::RecordShortcut,
@@ -1067,7 +1078,8 @@ fn draw_settings_native(canvas: &mut [u8], width: u32, height: u32, ui: &Ui, con
             ("Spacing and style", 254),
             ("Panel opening (applies next open)", 450),
             ("Browser window size", 570),
-            ("Open panels shortcut", 690),
+            ("Persist Changes to Panels", 690),
+            ("Open panels shortcut", 770),
         ] {
             font.draw(
                 canvas,
@@ -1091,6 +1103,7 @@ fn draw_settings_native(canvas: &mut [u8], width: u32, height: u32, ui: &Ui, con
             | Action::BumpHeight(delta)
             | Action::BumpStyle(_, delta)
             | Action::BumpFadeDuration(delta)
+            | Action::BumpPersistence(delta)
                 if delta < 0 => {}
             _ => continue,
         }
@@ -1183,8 +1196,10 @@ fn draw_settings_native(canvas: &mut [u8], width: u32, height: u32, ui: &Ui, con
             Action::BumpWidth(delta)
             | Action::BumpHeight(delta)
             | Action::BumpStyle(_, delta)
+            | Action::BumpPersistence(delta)
             | Action::BumpFadeDuration(delta) => {
                 let label = match hit.action {
+                    Action::BumpPersistence(_) => content.config.persist_changes_to_panels.label(),
                     Action::BumpFadeDuration(_) => {
                         format!("Fade duration {} ms", content.fade_duration_ms)
                     }
@@ -1221,6 +1236,20 @@ fn draw_settings_native(canvas: &mut [u8], width: u32, height: u32, ui: &Ui, con
         }
     }
     if let Some(font) = content.font {
+        font.draw(
+            canvas,
+            width,
+            stride,
+            24,
+            752,
+            12.0,
+            if content.config.persist_changes_to_panels == crate::config::Persistence::Login {
+                "Screen locking does not reset panels."
+            } else {
+                "Timed options reset after panels stay hidden."
+            },
+            content.palette.text,
+        );
         let message = font.ellipsize(
             &ui.shortcut_message,
             FONT_PX,
@@ -1231,7 +1260,7 @@ fn draw_settings_native(canvas: &mut [u8], width: u32, height: u32, ui: &Ui, con
             width,
             stride,
             24,
-            764,
+            844,
             FONT_PX,
             &message,
             content.palette.text,
@@ -1793,7 +1822,12 @@ mod tests {
         }
         for (width, height) in [(SETTINGS_WIDTH, SETTINGS_HEIGHT), (320, 400)] {
             let hits = settings_hits(width, height, &ui, &Config::default());
-            assert_eq!(hits.len(), 32);
+            assert_eq!(hits.len(), 34);
+            for delta in [-1, 1] {
+                assert!(hits
+                    .iter()
+                    .any(|hit| hit.action == Action::BumpPersistence(delta)));
+            }
             for mode in [
                 PanelAnimation::DesktopDefault,
                 PanelAnimation::FadeIn,

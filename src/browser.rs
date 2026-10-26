@@ -12,9 +12,12 @@
 //! ```text
 //! <title>\t<url>      show/raise the window and navigate
 //! hide                 dismiss the window (keeps it warm, off-screen)
+//! resume               reveal the same page without navigation
+//! restore <json>       prepare a saved session (loaded lazily on resume)
+//! reset <generation>   discard the old view and all session state
 //! parent <handle>      stack the browser above the exported dimming surface
 //! parent               forget the previous parent (it is being unmapped)
-//! size <w> <h>         destroy the old window, then create one at the new size
+//! size <w> <h>         resize without replacing the webview
 //! ```
 //!
 //! On a navigation command the helper presents the window first (so it shows
@@ -27,9 +30,14 @@
 //! panel daemon must not go down with it. If the helper dies, the next click
 //! restarts it (at the last configured size).
 
+use crate::{geometry, persistence};
+use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::io::{BufRead, BufWriter, Write};
+use std::os::unix::fs::DirBuilderExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::time::Duration;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use crate::config;
 use gtk::gdk::prelude::MonitorExt;
@@ -37,10 +45,47 @@ use gtk::glib;
 use gtk::glib::translate::ToGlibPtr;
 use gtk::prelude::*;
 use webkit2gtk::{
-    NavigationPolicyDecision, NavigationPolicyDecisionExt, NavigationType, PolicyDecisionExt,
-    PolicyDecisionType, URIRequestExt, WebViewExt,
+    BackForwardListExt, NavigationPolicyDecision, NavigationPolicyDecisionExt, NavigationType,
+    PolicyDecisionExt, PolicyDecisionType, URIRequestExt, WebViewExt,
 };
 use wry::{WebViewBuilder, WebViewBuilderExtUnix, WebViewExtUnix};
+
+/// Durable browser state. During ordinary toggles the actual WebView stays alive.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Snapshot {
+    pub open: bool,
+    pub url: Option<String>,
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+    pub maximized: bool,
+    pub fullscreen: bool,
+    pub geometry: Option<geometry::Geometry>,
+    pub history: Vec<u8>,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            open: false,
+            url: None,
+            title: "Browser".into(),
+            width: 1280,
+            height: 800,
+            maximized: false,
+            fullscreen: false,
+            geometry: None,
+            history: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Event {
+    pub generation: u64,
+    pub snapshot: Snapshot,
+}
 
 /// Only route web links with a different hostname to the desktop browser.
 /// Compare parsed hosts, so lookalike prefixes cannot count as the same site.
@@ -157,11 +202,20 @@ pub struct Browser {
     parent_handle: Option<String>,
     waiting_for_parent: bool,
     pending_open: Option<(String, String)>,
+    pending_resume: bool,
+    snapshot: Snapshot,
+    generation: u64,
+    sender: Option<calloop::channel::Sender<Event>>,
 }
 
 impl Browser {
     /// Start the helper now, hidden, so the first click is instant.
-    pub fn start(width: u32, height: u32) -> Self {
+    pub fn start(
+        width: u32,
+        height: u32,
+        snapshot: Snapshot,
+        sender: calloop::channel::Sender<Event>,
+    ) -> Self {
         let mut browser = Self {
             child: None,
             stdin: None,
@@ -172,6 +226,10 @@ impl Browser {
             parent_handle: None,
             waiting_for_parent: false,
             pending_open: None,
+            pending_resume: false,
+            snapshot,
+            generation: 0,
+            sender: Some(sender),
         };
         if !webkit_runtime_present() {
             log::warn!(
@@ -196,6 +254,10 @@ impl Browser {
             self.pending_open = Some((url.to_string(), title.to_string()));
             return;
         }
+        self.snapshot.open = true;
+        self.snapshot.url = Some(url.to_string());
+        self.snapshot.title = title.to_string();
+        let title = title.replace(['\n', '\r', '\t'], " ");
         let command = format!("{title}\t{url}\n");
         if self.write(&command) {
             self.window_open = true;
@@ -223,7 +285,11 @@ impl Browser {
             self.forget_helper();
         }
         if let Some((url, title)) = self.pending_open.take() {
+            self.pending_resume = false;
             self.open(&url, &title);
+        } else if self.pending_resume {
+            self.pending_resume = false;
+            self.resume();
         }
     }
 
@@ -231,18 +297,20 @@ impl Browser {
         self.waiting_for_parent = false;
         self.parent_handle = None;
         self.pending_open = None;
+        self.pending_resume = false;
         let _ = self.write("parent\n");
     }
 
     pub fn is_open(&self) -> bool {
-        self.window_open || self.pending_open.is_some()
+        self.window_open || self.pending_open.is_some() || self.pending_resume
     }
 
     /// Dismiss an on-screen browser window (Meta+F also does this). Keeps the
     /// helper — and its warm view — alive.
     pub fn dismiss(&mut self) {
         self.pending_open = None;
-        if !self.window_open || self.disabled {
+        self.pending_resume = false;
+        if self.disabled {
             return;
         }
         if self.write("hide\n") {
@@ -253,12 +321,66 @@ impl Browser {
         }
     }
 
+    /// Reveal the existing view, preserving history, scroll, forms and scripts.
+    pub fn resume(&mut self) {
+        if self.disabled || !self.snapshot.open {
+            return;
+        }
+        if self.waiting_for_parent {
+            self.pending_resume = true;
+            return;
+        }
+        self.ensure_child();
+        if !self.write("resume\n") {
+            self.forget_helper();
+            self.ensure_child();
+            self.window_open = self.write("resume\n");
+        } else {
+            self.window_open = true;
+        }
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        self.snapshot.clone()
+    }
+
+    pub fn on_event(&mut self, event: &Event, visible: bool) -> bool {
+        if event.generation != self.generation {
+            return false;
+        }
+        self.snapshot = event.snapshot.clone();
+        self.window_open = visible && self.snapshot.open;
+        true
+    }
+
+    /// Invalidate outstanding helper events so an expired cache cannot reappear.
+    pub fn reset(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.snapshot = Snapshot {
+            width: self.width,
+            height: self.height,
+            ..Snapshot::default()
+        };
+        self.pending_open = None;
+        self.pending_resume = false;
+        self.window_open = false;
+        // Stop the old WebKit processes before removing their profile. A cold
+        // helper is appropriate only when the retention boundary is reached.
+        self.forget_helper();
+        persistence::clear_browser_data();
+        if !self.disabled {
+            self.ensure_child();
+        }
+    }
+
     /// Change the default window size. Applied immediately if the helper is
-    /// alive (it rebuilds its hidden window); otherwise remembered for the
+    /// alive (without replacing its webview); otherwise remembered for the
     /// next spawn.
     pub fn set_size(&mut self, width: u32, height: u32) {
         self.width = config::clamp_browser_width(width);
         self.height = config::clamp_browser_height(height);
+        self.snapshot.width = self.width;
+        self.snapshot.height = self.height;
         if self.disabled {
             return;
         }
@@ -282,9 +404,21 @@ impl Browser {
     fn forget_helper(&mut self) {
         self.stdin = None;
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
+            let pid = child.id();
+            // EOF lets GTK release the temporary KWin script normally.
+            for _ in 0..20 {
+                if child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if child.try_wait().ok().flatten().is_none() {
+                let _ = child.kill();
+            }
             let _ = child.wait();
+            geometry::cleanup(pid);
         }
+        self.generation = self.generation.wrapping_add(1);
         self.window_open = false;
     }
 
@@ -305,15 +439,36 @@ impl Browser {
             .arg(self.height.to_string())
             .env("GDK_BACKEND", "wayland")
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             // Helper logs (env_logger) go to the same stderr as ours.
             .stderr(Stdio::inherit())
             .spawn()
         {
             Ok(mut child) => {
                 let stdin = child.stdin.take().map(BufWriter::new);
+                if let (Some(stdout), Some(sender)) = (child.stdout.take(), self.sender.clone()) {
+                    std::thread::spawn(move || {
+                        for line in std::io::BufReader::new(stdout).lines() {
+                            let Ok(line) = line else {
+                                break;
+                            };
+                            if let Ok(event) = serde_json::from_str::<Event>(&line) {
+                                if sender.send(event).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                }
                 self.child = Some(child);
                 self.stdin = stdin;
+                let event = Event {
+                    generation: self.generation,
+                    snapshot: self.snapshot.clone(),
+                };
+                if let Ok(json) = serde_json::to_string(&event) {
+                    let _ = self.write(&format!("restore {json}\n"));
+                }
                 // A restarted helper must import the parent before navigation.
                 if let Some(handle) = self.parent_handle.clone() {
                     let _ = self.write(&format!("parent {handle}\n"));
@@ -342,110 +497,44 @@ impl Drop for Browser {
 /// Exits when stdin closes (panel gone).
 pub fn run(width: Option<u32>, height: Option<u32>) -> anyhow::Result<()> {
     if !webkit_runtime_present() {
-        anyhow::bail!(
-            "WebKitGTK runtime not found — install libwebkit2gtk-4.1-dev \
-             (Debian/Ubuntu) or the equivalent"
-        );
+        anyhow::bail!("WebKitGTK runtime not found");
     }
-    if let Err(err) = gtk::init() {
-        anyhow::bail!("gtk::init failed: {err}");
-    }
-
-    let mut window = Window::create(
+    gtk::init().map_err(|err| anyhow::anyhow!("gtk::init failed: {err}"))?;
+    let placement = geometry::Placement::default();
+    let _bridge = match geometry::Bridge::start(placement.clone()) {
+        Ok(bridge) => Some(bridge),
+        Err(err) => {
+            log::warn!("browser placement restoration unavailable: {err:#}");
+            None
+        }
+    };
+    let mut defaults = (
         config::clamp_browser_width(width.unwrap_or(1280)),
         config::clamp_browser_height(height.unwrap_or(800)),
-    )?;
-    // Warm-up: let the queued `about:blank` load and web-process spawn make
-    // progress while still unmapped.
-    prewarm();
-    log::info!(
-        "browser ready (hidden, about:blank, {}x{})",
-        window.width,
-        window.height
     );
+    let mut window = Window::create(defaults.0, defaults.1, placement.clone())?;
+    prewarm();
+    log::info!("browser ready (hidden, about:blank)");
 
-    // stdin -> channel, so the main loop can multiplex with GTK.
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            match line {
-                Ok(line) => {
-                    if tx.send(line).is_err() {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    log::warn!("browser stdin error: {err}");
-                    break;
-                }
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if tx.send(line).is_err() {
+                break;
             }
         }
-        // Dropping `tx` tells the main loop the panel is gone.
     });
-
-    /// The helper's window + view, plus the last navigation target.
-    struct Window {
-        inner: gtk::Window,
-        webview: wry::WebView,
-        width: u32,
-        height: u32,
-        last_url: Option<String>,
-    }
-
-    impl Window {
-        fn create(width: u32, height: u32) -> anyhow::Result<Self> {
-            let inner = gtk::Window::new(gtk::WindowType::Toplevel);
-            inner.set_default_size(width as i32, height as i32);
-            inner.set_position(gtk::WindowPosition::Center);
-            inner.set_title("Browser");
-            // Closing hides rather than destroys: the view stays warm.
-            inner.connect_delete_event(|win, _| {
-                win.hide();
-                glib::Propagation::Stop
-            });
-            let webview = WebViewBuilder::new()
-                .with_url("about:blank")
-                .build_gtk(&inner)
-                .map_err(|err| anyhow::anyhow!("failed to create the webview: {err}"))?;
-            install_link_routing(&webview);
-            // Realise off-screen: `realize` builds the widget tree, and
-            // show/hide before any GTK iteration queues no Wayland commit —
-            // no flash, no mapped surface.
-            inner.realize();
-            center_window(&inner, width, height);
-            inner.show();
-            inner.hide();
-            Ok(Self {
-                inner,
-                webview,
-                width,
-                height,
-                last_url: None,
-            })
-        }
-
-        /// Unmap and destroy this toplevel. Dropping the Rust handle only
-        /// unrefs it; GTK keeps toplevels in its window list until
-        /// `gtk_widget_destroy`, which is why a resize used to leave the old
-        /// window on screen.
-        fn teardown(self) {
-            self.inner.hide();
-            drain_gtk();
-            drop(self.webview);
-            unsafe {
-                self.inner.destroy();
-            }
-            drop(self.inner);
-            drain_gtk();
-        }
-    }
-
+    let mut generation = 0;
+    let mut initialized = false;
+    let mut last_sent = None;
+    let mut next_snapshot = Instant::now();
     let mut parent_handle: Option<String> = None;
     loop {
-        while gtk::events_pending() {
-            gtk::main_iteration_do(false);
-        }
+        drain_gtk();
+        let mut changed = false;
         match rx.recv_timeout(Duration::from_millis(10)) {
             Ok(line) => match parse(&line) {
                 Some(Cmd::Parent { handle }) => {
@@ -456,70 +545,251 @@ pub fn run(width: Option<u32>, height: Option<u32>) -> anyhow::Result<()> {
                         }
                     }
                 }
+                Some(Cmd::Restore(event)) => {
+                    generation = event.generation;
+                    window.restore(event.snapshot);
+                    initialized = true;
+                    changed = true;
+                }
+                Some(Cmd::Resume) => {
+                    if window.wanted_open.get() {
+                        window.materialize();
+                        window.present(parent_handle.as_deref())?;
+                    }
+                    changed = true;
+                }
                 Some(Cmd::Navigate { title, url }) => {
-                    log::info!("browser: opening {url}");
+                    window.materialize();
+                    window.wanted_open.set(true);
                     window.inner.set_title(title);
-                    // Present first so the window shows immediately, then load.
-                    window.inner.present();
-                    // GTK may reset the GDK parent while mapping a toplevel.
-                    // Import after present, before pumping the next GTK frame.
-                    if let Some(handle) = &parent_handle {
-                        set_foreign_parent(&window.inner, handle)?;
-                    }
+                    window.present(parent_handle.as_deref())?;
                     if let Err(err) = window.webview.load_url(url) {
-                        log::warn!("browser: loading {url} failed: {err}");
+                        log::warn!("browser load failed: {err}");
                     }
-                    window.last_url = Some(url.to_string());
+                    initialized = true;
+                    changed = true;
                 }
                 Some(Cmd::Hide) => {
+                    // Keep logical visibility: only a user close cancels reopening.
                     window.inner.hide();
-                    log::debug!("browser: window dismissed (kept warm)");
+                    changed = true;
+                }
+                Some(Cmd::Reset(next_generation)) => {
+                    generation = next_generation;
+                    window.teardown();
+                    persistence::clear_browser_data();
+                    placement.set(None);
+                    window = Window::create(defaults.0, defaults.1, placement.clone())?;
+                    initialized = true;
+                    changed = true;
+                    last_sent = None;
                 }
                 Some(Cmd::Size { width, height }) => {
                     let width = config::clamp_browser_width(width);
                     let height = config::clamp_browser_height(height);
-                    if width == window.width && height == window.height {
-                        continue;
+                    defaults = (width, height);
+                    window.width = width;
+                    window.height = height;
+                    // GTK negotiates an xdg-toplevel resize. Keep the same view
+                    // so editing the default size does not reload the page.
+                    window.inner.resize(width as i32, height as i32);
+                    if let Some(snapshot) = &mut window.pending {
+                        snapshot.width = width;
+                        snapshot.height = height;
                     }
-                    // Wayland clients cannot resize their own toplevels, so
-                    // destroy the old window first and create a replacement
-                    // at the new size, centered on the current monitor.
-                    let was_visible = window.inner.is_visible();
-                    let previous = window.last_url.clone();
-                    log::info!("browser: resizing to {width}x{height}");
-                    window.teardown();
-                    match Window::create(width, height) {
-                        Ok(mut fresh) => {
-                            prewarm();
-                            fresh.last_url = previous.clone();
-                            if was_visible {
-                                fresh.inner.present();
-                                if let Some(handle) = &parent_handle {
-                                    set_foreign_parent(&fresh.inner, handle)?;
-                                }
-                                center_window(&fresh.inner, width, height);
-                                if let Some(url) = previous {
-                                    if let Err(err) = fresh.webview.load_url(&url) {
-                                        log::warn!("browser: reload failed: {err}");
-                                    }
-                                }
-                            }
-                            window = fresh;
-                        }
-                        Err(err) => {
-                            log::error!("browser: resize failed: {err}");
-                            break;
-                        }
-                    }
+                    changed = true;
                 }
-                None => log::warn!("browser: malformed command {line:?}"),
+                None => log::warn!("browser: malformed command"),
             },
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        if initialized && (changed || Instant::now() >= next_snapshot) {
+            let snapshot = window.snapshot();
+            if last_sent.as_ref() != Some(&snapshot) {
+                let event = Event {
+                    generation,
+                    snapshot: snapshot.clone(),
+                };
+                let mut stdout = std::io::stdout().lock();
+                serde_json::to_writer(&mut stdout, &event)?;
+                writeln!(stdout)?;
+                stdout.flush()?;
+                last_sent = Some(snapshot);
+            }
+            next_snapshot = Instant::now() + Duration::from_millis(500);
+        }
     }
-    log::info!("browser helper exiting");
+    window.teardown();
     Ok(())
+}
+
+struct Window {
+    inner: gtk::Window,
+    webview: wry::WebView,
+    width: u32,
+    height: u32,
+    wanted_open: Rc<Cell<bool>>,
+    placement: geometry::Placement,
+    pending: Option<Snapshot>,
+    context: Option<wry::WebContext>,
+}
+
+impl Window {
+    fn create(width: u32, height: u32, placement: geometry::Placement) -> anyhow::Result<Self> {
+        let inner = gtk::Window::new(gtk::WindowType::Toplevel);
+        inner.set_default_size(width as i32, height as i32);
+        inner.set_position(gtk::WindowPosition::Center);
+        inner.set_title("Browser");
+        let wanted_open = Rc::new(Cell::new(false));
+        let closed = wanted_open.clone();
+        inner.connect_delete_event(move |win, _| {
+            closed.set(false);
+            win.hide();
+            glib::Propagation::Stop
+        });
+        let mut context = if let Some(path) = persistence::browser_data_path() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&path)?;
+            Some(wry::WebContext::new(Some(path)))
+        } else {
+            None
+        };
+        let builder = match context.as_mut() {
+            Some(context) => WebViewBuilder::new_with_web_context(context),
+            None => WebViewBuilder::new(),
+        };
+        let webview = builder
+            .with_url("about:blank")
+            .build_gtk(&inner)
+            .map_err(|err| anyhow::anyhow!("failed to create webview: {err}"))?;
+        install_link_routing(&webview);
+        inner.realize();
+        center_window(&inner, width, height);
+        inner.show();
+        inner.hide();
+        Ok(Self {
+            inner,
+            webview,
+            width,
+            height,
+            wanted_open,
+            placement,
+            pending: None,
+            context,
+        })
+    }
+
+    fn restore(&mut self, snapshot: Snapshot) {
+        self.wanted_open.set(snapshot.open);
+        self.width = config::clamp_browser_width(snapshot.width);
+        self.height = config::clamp_browser_height(snapshot.height);
+        self.inner.resize(self.width as i32, self.height as i32);
+        self.inner.set_title(&snapshot.title);
+        self.placement.set(snapshot.geometry);
+        self.pending = Some(snapshot);
+    }
+
+    /// Disk restoration is lazy; ordinary hide/show never navigates or reloads.
+    fn materialize(&mut self) {
+        let Some(snapshot) = self.pending.take() else {
+            return;
+        };
+        let view = self.webview.webview();
+        let mut restored = false;
+        if !snapshot.history.is_empty() {
+            let bytes = glib::Bytes::from(&snapshot.history);
+            // A truncated/invalid cache can produce NULL. Check before wrapping
+            // rather than passing it through gtk-rs's non-null constructor.
+            unsafe {
+                let raw =
+                    webkit2gtk::ffi::webkit_web_view_session_state_new(bytes.to_glib_none().0);
+                if !raw.is_null() {
+                    let state: webkit2gtk::WebViewSessionState =
+                        glib::translate::from_glib_full(raw);
+                    view.restore_session_state(&state);
+                    if let Some(item) = view
+                        .back_forward_list()
+                        .and_then(|list| list.current_item())
+                    {
+                        view.go_to_back_forward_list_item(&item);
+                        restored = true;
+                    }
+                }
+            }
+        }
+        if !restored {
+            if let Some(url) = snapshot.url {
+                view.load_uri(&url);
+            }
+        }
+        if snapshot.maximized {
+            self.inner.maximize();
+        }
+        if snapshot.fullscreen {
+            self.inner.fullscreen();
+        }
+    }
+
+    fn present(&self, parent: Option<&str>) -> anyhow::Result<()> {
+        self.inner.present();
+        if let Some(handle) = parent {
+            set_foreign_parent(&self.inner, handle)?;
+        }
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        if let Some(snapshot) = &self.pending {
+            return snapshot.clone();
+        }
+        let (width, height) = self.inner.size();
+        let view = self.webview.webview();
+        let url = view
+            .uri()
+            .map(|uri| uri.to_string())
+            .filter(|uri| uri != "about:blank");
+        let history = if url.is_some() {
+            view.session_state()
+                .and_then(|state| state.serialize())
+                .map(|bytes| bytes.as_ref().to_vec())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Snapshot {
+            open: self.wanted_open.get(),
+            url,
+            title: self
+                .inner
+                .title()
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+            width: width.max(1) as u32,
+            height: height.max(1) as u32,
+            maximized: self.inner.is_maximized(),
+            fullscreen: self
+                .inner
+                .window()
+                .is_some_and(|win| win.state().contains(gtk::gdk::WindowState::FULLSCREEN)),
+            geometry: self.placement.get(),
+            history,
+        }
+    }
+
+    fn teardown(self) {
+        self.inner.hide();
+        drain_gtk();
+        drop(self.webview);
+        unsafe {
+            self.inner.destroy();
+        }
+        drop(self.inner);
+        drop(self.context);
+        drain_gtk();
+    }
 }
 
 /// Commands understood by the helper, one per stdin line.
@@ -528,10 +798,16 @@ enum Cmd<'a> {
     Parent { handle: Option<&'a str> },
     Navigate { title: &'a str, url: &'a str },
     Hide,
+    Resume,
+    Restore(Event),
+    Reset(u64),
     Size { width: u32, height: u32 },
 }
 
 fn parse(line: &str) -> Option<Cmd<'_>> {
+    if let Some(json) = line.strip_prefix("restore ") {
+        return serde_json::from_str(json).ok().map(Cmd::Restore);
+    }
     if let Some((title, url)) = line.split_once('\t') {
         return Some(Cmd::Navigate { title, url });
     }
@@ -545,6 +821,8 @@ fn parse(line: &str) -> Option<Cmd<'_>> {
             Some(Cmd::Parent { handle })
         }
         "hide" => Some(Cmd::Hide),
+        "resume" => Some(Cmd::Resume),
+        "reset" => Some(Cmd::Reset(parts.next()?.parse().ok()?)),
         "size" => Some(Cmd::Size {
             width: parts.next()?.parse().ok()?,
             height: parts.next()?.parse().ok()?,
@@ -678,6 +956,10 @@ mod tests {
             parent_handle: None,
             waiting_for_parent: false,
             pending_open: None,
+            pending_resume: false,
+            snapshot: Snapshot::default(),
+            generation: 0,
+            sender: None,
         };
         browser.wait_for_parent();
         browser.open("https://example.com/", "Example");
@@ -696,6 +978,41 @@ mod tests {
         assert_eq!(browser.parent_handle.as_deref(), Some("backdrop-handle"));
         browser.clear_parent();
         assert!(browser.parent_handle.is_none());
+
+        browser.snapshot.open = true;
+        browser.snapshot.url = Some("https://example.com/current".into());
+        browser.wait_for_parent();
+        browser.resume();
+        assert!(browser.pending_resume);
+        assert!(browser.is_open());
+        browser.dismiss();
+        assert!(!browser.pending_resume);
+        assert!(
+            browser.snapshot.open,
+            "shortcut hide preserves logical visibility"
+        );
+        let stale = Event {
+            generation: browser.generation,
+            snapshot: browser.snapshot.clone(),
+        };
+        browser.generation = browser.generation.wrapping_add(1);
+        browser.snapshot = Snapshot::default();
+        assert!(
+            !browser.on_event(&stale, true),
+            "late events must not resurrect expired sessions"
+        );
+        assert!(!browser.snapshot.open);
+        let closed = Event {
+            generation: browser.generation,
+            snapshot: Snapshot {
+                open: false,
+                ..stale.snapshot
+            },
+        };
+        assert!(browser.on_event(&closed, true));
+        browser.wait_for_parent();
+        browser.resume();
+        assert!(!browser.pending_resume, "a user-closed window stays closed");
     }
 
     #[test]
@@ -712,6 +1029,19 @@ mod tests {
     #[test]
     fn parses_control_commands() {
         assert!(matches!(parse("hide"), Some(Cmd::Hide)));
+        assert!(matches!(parse("resume"), Some(Cmd::Resume)));
+        assert!(matches!(parse("reset 42"), Some(Cmd::Reset(42))));
+        let event = Event {
+            generation: 42,
+            snapshot: Snapshot::default(),
+        };
+        assert!(matches!(
+            parse(&format!(
+                "restore {}",
+                serde_json::to_string(&event).unwrap()
+            )),
+            Some(Cmd::Restore(Event { generation: 42, .. }))
+        ));
         assert!(matches!(
             parse("parent backdrop-handle"),
             Some(Cmd::Parent {

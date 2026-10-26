@@ -34,6 +34,76 @@ impl PanelAnimation {
 
 pub const MAX_FADE_DURATION_MS: u32 = 5000;
 
+/// Lifetime of remembered panel/browser state, separate from saved preferences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum Persistence {
+    #[default]
+    Always,
+    Minutes(u32),
+    Login,
+    Restart,
+}
+
+impl Persistence {
+    pub const ALL: [Self; 11] = [
+        Self::Always,
+        Self::Minutes(1),
+        Self::Minutes(5),
+        Self::Minutes(10),
+        Self::Minutes(15),
+        Self::Minutes(30),
+        Self::Minutes(60),
+        Self::Minutes(120),
+        Self::Minutes(240),
+        Self::Login,
+        Self::Restart,
+    ];
+
+    pub fn choices() -> &'static [Self] {
+        &Self::ALL
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Self::Always => "0 (Always persist)".into(),
+            Self::Minutes(n) if n >= 60 => format!("{}hr", n / 60),
+            Self::Minutes(n) => format!("{n}m"),
+            Self::Login => "User login/logout".into(),
+            Self::Restart => "Computer restart".into(),
+        }
+    }
+
+    pub fn step(self, delta: i32) -> Self {
+        let choices = Self::choices();
+        let index = choices.iter().position(|&p| p == self).unwrap_or(0);
+        choices[(index as i32 + delta).clamp(0, choices.len() as i32 - 1) as usize]
+    }
+}
+
+impl From<Persistence> for String {
+    fn from(value: Persistence) -> Self {
+        match value {
+            Persistence::Always => "0".into(),
+            Persistence::Minutes(n) if n >= 60 => format!("{}hr", n / 60),
+            Persistence::Minutes(n) => format!("{n}m"),
+            Persistence::Login => "login_logout".into(),
+            Persistence::Restart => "restart".into(),
+        }
+    }
+}
+
+impl TryFrom<String> for Persistence {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, String> {
+        Self::choices()
+            .iter()
+            .copied()
+            .find(|&p| String::from(p) == value)
+            .ok_or_else(|| format!("invalid panel persistence: {value}"))
+    }
+}
+
 /// Saved appearance preference. System follows the desktop portal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -160,6 +230,7 @@ pub struct Config {
     pub panel_animation: PanelAnimation,
     /// Fade-in duration in milliseconds (0 shows immediately).
     pub fade_duration_ms: u32,
+    pub persist_changes_to_panels: Persistence,
     /// Global shortcut, in a `Modifier+Key` form, e.g. `"Meta+F"`.
     pub shortcut: String,
     /// Default browser window width (see the panel's Settings UI).
@@ -187,6 +258,7 @@ impl Default for Config {
             desktop_dim: 20,
             panel_animation: PanelAnimation::DesktopDefault,
             fade_duration_ms: 150,
+            persist_changes_to_panels: Persistence::Always,
             shortcut: "Meta+F".to_string(),
             browser_width: 1280,
             browser_height: 800,
@@ -392,6 +464,31 @@ mod tests {
         assert_eq!(parsed.sections[0].websites[0].url, "http://localhost:6005/");
         assert_eq!(parsed.sections[0].websites[1].url, "http://localhost:6006/");
         assert_eq!(parsed.sections[0].websites[0].title, None);
+    }
+
+    #[test]
+    fn persistence_defaults_choices_and_validation() {
+        assert_eq!(
+            Config::parse("").unwrap().persist_changes_to_panels,
+            Persistence::Always
+        );
+        for &policy in Persistence::choices() {
+            let config = Config {
+                persist_changes_to_panels: policy,
+                ..Config::default()
+            };
+            assert_eq!(
+                Config::parse(&toml::to_string(&config).unwrap())
+                    .unwrap()
+                    .persist_changes_to_panels,
+                policy
+            );
+        }
+        assert_eq!(Persistence::choices().len(), 11);
+        assert_eq!(Persistence::Always.step(-1), Persistence::Always);
+        assert_eq!(Persistence::Restart.step(1), Persistence::Restart);
+        assert_eq!(Persistence::Always.step(1), Persistence::Minutes(1));
+        assert!(Config::parse("persist_changes_to_panels = 'invalid'").is_err());
     }
 
     #[test]

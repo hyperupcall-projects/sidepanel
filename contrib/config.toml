@@ -35,6 +35,14 @@ panel_animation = "desktop_default"
 # Fade duration: 0-5000 ms (0 is immediate); Settings steps by 25 ms.
 fade_duration_ms = 150
 
+# Remember open pages, window placement, panel state and editor drafts.
+# "0" always persists (default). Other choices: "1m", "5m", "10m", "15m",
+# "30m", "1hr", "2hr", "4hr", "login_logout", "restart".
+# Timed choices reset after the panels stay hidden for that long. Login/logout
+# means a real graphical login boundary; locking/unlocking does not reset it.
+# Expiry clears session data and the browser profile, keeping this config.
+persist_changes_to_panels = "0"
+
 # Global shortcut, as Modifier+Key. Modifiers: Meta/Super/Logo/Win, Ctrl,
 # Alt, Shift. Keys: a-z, 0-9, space, escape, tab, return, backspace, delete,
 # home, end, left/up/right/down, pageup, pagedown, f1-f12.
@@ -44,7 +52,7 @@ fade_duration_ms = 150
 # System Settings -> Shortcuts, where the user can rebind it. A user-set
 # binding is respected on subsequent launches.
 #
-# Pressing the shortcut dismisses any browser window the panel opened.
+# Pressing the shortcut hides the panels/browser together, then restores them.
 shortcut = "Meta+F"
 
 # Default browser window size (640-3840 x 400-2160). Also adjustable from

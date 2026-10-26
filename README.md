@@ -6,7 +6,8 @@ Press a global shortcut (default **Meta+F**) and a frame of **four edge panels
 and four corner boxes** appears around the screen. The desktop behind them
 dims slightly; the center and gaps let pointer clicks reach the desktop.
 Press it again to dismiss.
-The first website is highlighted each time the panel opens. Use **Alt+J** to
+The first website is highlighted on a fresh session; reopening preserves your
+selection and panel state. Use **Alt+J** to
 move down, **Alt+K** to move up, and **Enter** to open the highlighted website.
 Navigation stops at the first and last visible entries; holding Alt+J or Alt+K
 repeats the movement.
@@ -79,8 +80,41 @@ value in that range. Changes are saved immediately and apply the next time
 the frame or settings card opens. The backdrop shares the frame's fade.
 The separate browser window retains the desktop's normal animation.
 
-Pressing **Meta+F** again dismisses the frame, settings, and any browser window
-it opened. The browser is only hidden, so the next bookmark click is just as fast.
+Pressing the configured shortcut (for example **Meta+H**) hides the frame,
+settings, and browser together. Press it again to restore what was open. The
+same live browser page stays loaded, including navigation, scroll position,
+unsaved form input, and JavaScript state. Closing the browser with its close
+button leaves it closed when the panels reopen. Section expansion, panel
+scrolling, keyboard selection, the open Settings tab, and editor drafts are
+remembered too.
+
+Settings → Appearance → **Persist Changes to Panels** controls when remembered
+session data is cleared. Its default is **0 (Always persist)**. The choices are
+**1m, 5m, 10m, 15m, 30m, 1hr, 2hr, 4hr, User login/logout**, and
+**Computer restart**. Timed choices expire after the panels have stayed hidden
+for that duration; reopening before the deadline starts a new hidden interval
+on the next dismissal. Login/logout uses the real logind graphical-session
+identity: screen locking, unlocking, and suspend do not reset it. Computer
+restart uses the kernel boot ID. Expired data is discarded before restoration,
+and timed sessions are also cleared in the background while the app runs.
+Bookmarks, panel sizes, appearance, and other preferences remain saved.
+
+Session snapshots and the private browser profile live under
+`$XDG_STATE_HOME/sidepanel/` (normally `~/.local/state/sidepanel/`), separately
+from `config.toml`. App restarts restore the current URL, WebKit history,
+window size/position, and panel state on the next shortcut press. Live page
+memory is preserved across hide/show; after a process or computer restart the
+page must load again, and recovery of page-managed drafts depends on the site.
+The browser profile retains cookies and site storage until the chosen reset
+boundary. On expiration the old browser process is stopped and its profile
+removed.
+
+Window placement is recorded and restored through a temporary, browser-PID-scoped
+[KWin script](https://develop.kde.org/docs/plasma/kwin/api/), since Wayland
+clients cannot choose their own global positions. It is unloaded with the
+helper and does not install window rules. If KWin scripting is unavailable,
+page/panel persistence still works, with placement left to the compositor.
+Windows whose monitor has disappeared are brought back onto a current output.
 
 ## Why this design
 
@@ -195,6 +229,7 @@ opacity = 100      # 20-100%; 100 means no transparency
 desktop_dim = 20   # 0-100%; 0 disables desktop dimming
 panel_animation = "desktop_default" # "desktop_default", "fade_in", or "instant"
 fade_duration_ms = 150 # 0-5000 ms; used by "fade_in"
+persist_changes_to_panels = "0" # always; also 1m, 5m, 10m, 15m, 30m, 1hr, 2hr, 4hr, login_logout, restart
 shortcut = "Meta+F"
 theme = "system"   # "light", "dark", or "system"
 

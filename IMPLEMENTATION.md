@@ -7,6 +7,36 @@ desktop remains accessible through the center and gaps. The bottom-left box
 opens a separate settings overlay on the same output. The earlier single
 sidebar implementation described below is retained as design history.
 
+Panel sessions now survive shortcut hide/show. `Ui::select_first` runs only
+for a fresh or expired session; hiding retains the Settings card/tab, selection,
+collapsed sections, per-rectangle scrolling, editor drafts, and text cursors.
+`Browser::resume` presents the existing WebView without navigation, after the
+new backdrop parent is ready. Native close updates logical visibility through
+helper stdout events, so a closed browser is not reopened.
+
+`src/persistence.rs` stores a versioned JSON session with a private, atomic
+0600 write under XDG_STATE_HOME/sidepanel; preferences remain in config.toml.
+A one-second timer saves changed panel state and checks hidden-session expiry.
+Browser events include the current URI, serialized WebKit history, window state,
+and placement. Their generation prevents old helper events from resurrecting
+expired state. Startup restores lazily, without fetching the saved URL until
+the next shortcut. A session-specific WebContext profile retains cookies and
+site storage; expiration stops the old helper before removing the profile.
+Duration policies start when the panels are hidden, and hidden background
+updates never slide that deadline. Login policies compare logind graphical
+session ID + creation timestamp and boot ID, independently of LockedHint;
+restart policies compare only boot ID. Startup discards expired/corrupt caches.
+
+`src/geometry.rs` hosts a tiny D-Bus geometry bridge and loads `src/geometry.js`
+as a temporary KWin script scoped to the helper PID. KWin records frame geometry
+and reapplies it to remapped browser windows, including after a helper restart;
+if the original output disappeared it brings the window onto a current output.
+The script is unloaded at helper teardown, with parent-side crash cleanup.
+See the [KWin scripting API](https://develop.kde.org/docs/plasma/kwin/api/).
+Browser size controls now use GTK resize negotiation and retain the same
+WebView; a live KWin/Wayland check confirmed size changes preserve page state.
+The older rebuilding and clean-start behavior described below is design history.
+
 Settings now has Appearance and Contents tabs. `Config::sections` stores ordered
 `Section { rectangle, title, websites }` records for the four edge rectangles;
 the `Rectangle` enum excludes corners. `Config::parse` migrates legacy top-level
@@ -654,8 +684,9 @@ full-height keyboard-grabbing surface could trap the user. It does not: KWin's
 `isKeyboardShortcutsInhibited()` is set, and a layer surface does not set it. So
 **Meta+F always dismisses the panel** — you cannot get stuck.
 
-Opening the panel selects the first website (`Ui::select_first`) and expands
-the list. **Alt+J** / **Alt+K** move that selection down and up through the
+A fresh panel session selects the first website (`Ui::select_first`) and expands
+the list. Reopening preserves the existing selection, collapsed sections, and
+scroll positions. **Alt+J** / **Alt+K** move that selection down and up through the
 rows still present in `layout` (so clipped overflow rows are skipped), and
 **Enter** activates the selected row through the same `App::activate` path as
 a click. Repeats of Alt+J/K keep moving; Enter does not retrigger. Shortcut
@@ -782,10 +813,9 @@ whole row, and the value label is painted exactly once (by the left half).
 Clicks step by 40 px within 640–3840 × 400–2160, persist with `Config::save`,
 and send `size <w> <h>` to the helper.
 
-**Pitfall — resizing on Wayland.** Clients cannot resize their own toplevels,
-so `gtk_window_resize` is a no-op. The helper instead *rebuilds* its
-(usually hidden) window at the new size — and only re-presents/reloads the
-last URL if the window was visible when the size changed.
+**Current resize behavior.** GTK negotiates the requested client size with KWin
+using `gtk_window_resize`, retaining the live WebView. This replaces the earlier
+window-rebuilding workaround, which lost navigation and unsaved page state.
 
 `Config::save` is a full TOML rewrite: `browser_width`/`browser_height` are
 declared **before** `[[websites]]` because TOML requires scalar values to
@@ -800,11 +830,9 @@ updates travel through calloop and repaint both surfaces when System is selected
 Both surfaces share an explicit light/dark palette for text, backgrounds, hover,
 selection, dividers, and placeholder icons.
 
-**Meta+F dismisses too.** `App::toggle` calls `Browser::dismiss` (a `hide`
-line) before showing or hiding the panel — summoning starts clean, hiding
-takes the browser with it. The helper just `window.hide()`s: the view stays
-warm, and the helper process only exits when the panel goes away (stdin
-EOF) or crashes (then the next click respawns it at the configured size).
+**Shortcut toggling.** Hiding sends `hide`, preserving the live view. Showing
+sends `resume` after importing the new backdrop parent, without loading a URL.
+The browser process stays warm unless it crashes or session retention expires.
 
 ### 3.7 Verifying it
 - Unit: `keyboard_selection_starts_at_first_and_stops_at_ends`;
